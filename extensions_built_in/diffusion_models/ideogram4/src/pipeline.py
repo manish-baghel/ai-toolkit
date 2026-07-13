@@ -24,6 +24,7 @@ from .transformer import (
     QWEN3_VL_ACTIVATION_LAYERS,
     SEQUENCE_PADDING_INDICATOR,
     Ideogram4Transformer2DModel,
+    Ideogram4TransformerContext,
 )
 
 _LOGSNR_MIN = -15.0
@@ -176,6 +177,19 @@ class Ideogram4PackedContext:
     num_image_tokens: int
     gh: int
     gw: int
+
+
+@dataclass
+class Ideogram4PreparedVelocityContext:
+    """Reusable projected conditioning and geometry for velocity prediction."""
+
+    transformer_context: Ideogram4TransformerContext
+    num_text_tokens: int
+    num_image_tokens: int
+    batch_size: int
+    gh: int
+    gw: int
+    attention_backend: str
 
 
 def pad_text_features(
@@ -347,6 +361,76 @@ def predict_velocity_with_context(
     image_velocity = out[:, packed_context.num_text_tokens:]  # (B, Li, 128)
     image_velocity = image_velocity.reshape(b, gh, gw, c).permute(0, 3, 1, 2)
     # Model predicts clean - noise; negate to return toolkit velocity (noise - clean).
+    return -image_velocity
+
+
+def prepare_velocity_context(
+    transformer: Ideogram4Transformer2DModel,
+    llm_features: torch.Tensor,
+    text_mask: torch.Tensor,
+    gh: int,
+    gw: int,
+    *,
+    detach: bool = False,
+) -> Ideogram4PreparedVelocityContext:
+    """Project conditioning and build static geometry once for repeated steps.
+
+    ``detach=True`` is intended for training caches whose preparation modules
+    are frozen. Eligibility for that mode is enforced by the Ideogram model
+    integration, where the active LoRA scope is known.
+    """
+    packed_context = prepare_packed_context(llm_features, text_mask, gh, gw)
+
+    if detach:
+        with torch.no_grad():
+            transformer_context = transformer.prepare_context(
+                llm_features=packed_context.llm_features,
+                position_ids=packed_context.position_ids,
+                segment_ids=packed_context.segment_ids,
+                indicator=packed_context.indicator,
+            )
+    else:
+        transformer_context = transformer.prepare_context(
+            llm_features=packed_context.llm_features,
+            position_ids=packed_context.position_ids,
+            segment_ids=packed_context.segment_ids,
+            indicator=packed_context.indicator,
+        )
+
+    return Ideogram4PreparedVelocityContext(
+        transformer_context=transformer_context,
+        num_text_tokens=packed_context.num_text_tokens,
+        num_image_tokens=packed_context.num_image_tokens,
+        batch_size=packed_context.llm_features.shape[0],
+        gh=gh,
+        gw=gw,
+        attention_backend=transformer.attention_backend,
+    )
+
+
+def predict_velocity_with_prepared_context(
+    transformer: Ideogram4Transformer2DModel,
+    latents: torch.Tensor,
+    t: torch.Tensor,
+    prepared_context: Ideogram4PreparedVelocityContext,
+) -> torch.Tensor:
+    """Predict velocity without rebuilding frozen conditioning or geometry."""
+    b, c, gh, gw = latents.shape
+    if prepared_context.gh != gh or prepared_context.gw != gw:
+        raise ValueError("Prepared Ideogram context does not match latent geometry")
+    if prepared_context.batch_size != b:
+        raise ValueError("Prepared Ideogram context does not match latent batch size")
+    if prepared_context.attention_backend != transformer.attention_backend:
+        raise ValueError("Prepared Ideogram context uses a different attention backend")
+
+    x = pack_latent_tokens(latents, prepared_context.num_text_tokens)
+    out = transformer.forward_with_context(
+        x=x,
+        t=1.0 - t,
+        context=prepared_context.transformer_context,
+    )
+    image_velocity = out[:, prepared_context.num_text_tokens:]
+    image_velocity = image_velocity.reshape(b, gh, gw, c).permute(0, 3, 1, 2)
     return -image_velocity
 
 
