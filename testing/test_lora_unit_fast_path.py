@@ -7,11 +7,13 @@ standalone scripts that are not safe for automatic test discovery::
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
 from toolkit.lora_special import LoRAModule
+from toolkit import network_mixins
 
 
 class _FakeNetwork:
@@ -21,18 +23,38 @@ class _FakeNetwork:
         self.is_lorm = False
         self.is_merged_in = False
         self._multiplier = multiplier
+        self._multiplier_is_one = network_mixins._is_fixed_unit_multiplier(multiplier)
         self.torch_multiplier = torch.tensor(multiplier, dtype=torch.float32).reshape(-1)
 
 
-def _deterministic_weight(shape, start, end):
-    return torch.linspace(start, end, steps=torch.tensor(shape).prod().item()).reshape(shape)
+def _deterministic_weight(shape, start, end, device="cpu", dtype=torch.float32):
+    return torch.linspace(
+        start,
+        end,
+        steps=torch.tensor(shape).prod().item(),
+        device=device,
+        dtype=torch.float32,
+    ).reshape(shape).to(dtype=dtype)
 
 
-def _build_lora(alpha=3, multiplier=1.0):
-    base = torch.nn.Linear(5, 4, bias=False)
+def _build_lora(
+    alpha=3,
+    multiplier=1.0,
+    device="cpu",
+    base_dtype=torch.float32,
+):
+    base = torch.nn.Linear(5, 4, bias=False).to(device=device, dtype=base_dtype)
     base.weight.requires_grad_(False)
     with torch.no_grad():
-        base.weight.copy_(_deterministic_weight(base.weight.shape, -0.3, 0.4))
+        base.weight.copy_(
+            _deterministic_weight(
+                base.weight.shape,
+                -0.3,
+                0.4,
+                device=device,
+                dtype=base_dtype,
+            )
+        )
 
     network = _FakeNetwork(multiplier)
     lora = LoRAModule(
@@ -43,12 +65,18 @@ def _build_lora(alpha=3, multiplier=1.0):
         alpha=alpha,
         network=network,
     )
+    lora.to(device=device, dtype=torch.float32)
+    network.torch_multiplier = network.torch_multiplier.to(device=device)
     with torch.no_grad():
         lora.lora_down.weight.copy_(
-            _deterministic_weight(lora.lora_down.weight.shape, -0.2, 0.25)
+            _deterministic_weight(
+                lora.lora_down.weight.shape, -0.2, 0.25, device=device
+            )
         )
         lora.lora_up.weight.copy_(
-            _deterministic_weight(lora.lora_up.weight.shape, -0.15, 0.3)
+            _deterministic_weight(
+                lora.lora_up.weight.shape, -0.15, 0.3, device=device
+            )
         )
     lora.apply_to()
     return base, lora, network
@@ -57,13 +85,16 @@ def _build_lora(alpha=3, multiplier=1.0):
 def _legacy_forward(x, base_weight, down_weight, up_weight, alpha, multiplier):
     """Reproduce ToolkitModuleMixin's pre-optimization arithmetic exactly."""
     base_output = F.linear(x, base_weight)
-    lora_output = F.linear(F.linear(x, down_weight), up_weight)
+    lora_input = x.to(dtype=down_weight.dtype)
+    lora_output = F.linear(F.linear(lora_input, down_weight), up_weight)
 
-    scalar = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+    scalar = torch.tensor(1.0, device=x.device, dtype=down_weight.dtype)
     scale = (alpha / down_weight.shape[0]) * scalar
     lora_output = lora_output * scale
 
-    multiplier_tensor = torch.tensor(multiplier, device=x.device, dtype=x.dtype).reshape(-1)
+    multiplier_tensor = torch.tensor(
+        multiplier, device=x.device, dtype=down_weight.dtype
+    ).reshape(-1)
     if lora_output.shape[0] != multiplier_tensor.shape[0]:
         repeats = lora_output.shape[0] // multiplier_tensor.shape[0]
         multiplier_tensor = multiplier_tensor.repeat_interleave(repeats)
@@ -74,13 +105,34 @@ def _legacy_forward(x, base_weight, down_weight, up_weight, alpha, multiplier):
 
 
 class LoRAUnitFastPathParityTest(unittest.TestCase):
-    def _assert_training_step_parity(self, alpha, multiplier, batch_size=1, exact=True):
+    def _assert_training_step_parity(
+        self,
+        alpha,
+        multiplier,
+        batch_size=1,
+        exact=True,
+        device="cpu",
+        base_dtype=torch.float32,
+    ):
         torch.manual_seed(7)
-        base, lora, _ = _build_lora(alpha=alpha, multiplier=multiplier)
+        base, lora, _ = _build_lora(
+            alpha=alpha,
+            multiplier=multiplier,
+            device=device,
+            base_dtype=base_dtype,
+        )
 
-        actual_x = _deterministic_weight((batch_size, 7, 5), -0.4, 0.5).requires_grad_(True)
+        actual_x = _deterministic_weight(
+            (batch_size, 7, 5),
+            -0.4,
+            0.5,
+            device=device,
+            dtype=base_dtype,
+        ).requires_grad_(True)
         reference_x = actual_x.detach().clone().requires_grad_(True)
-        target = _deterministic_weight((batch_size, 7, 4), -0.25, 0.35)
+        target = _deterministic_weight(
+            (batch_size, 7, 4), -0.25, 0.35, device=device
+        )
 
         reference_down = torch.nn.Parameter(lora.lora_down.weight.detach().clone())
         reference_up = torch.nn.Parameter(lora.lora_up.weight.detach().clone())
@@ -109,8 +161,8 @@ class LoRAUnitFastPathParityTest(unittest.TestCase):
             alpha,
             multiplier,
         )
-        actual_loss = F.mse_loss(actual_output, target)
-        reference_loss = F.mse_loss(reference_output, target)
+        actual_loss = F.mse_loss(actual_output.float(), target)
+        reference_loss = F.mse_loss(reference_output.float(), target)
 
         compare = torch.equal if exact else lambda left, right: torch.allclose(
             left, right, rtol=1e-6, atol=1e-7
@@ -144,6 +196,16 @@ class LoRAUnitFastPathParityTest(unittest.TestCase):
     def test_unit_scale_and_multiplier_are_exact(self):
         self._assert_training_step_parity(alpha=3, multiplier=1.0, exact=True)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_cuda_bfloat16_unit_path_is_exact(self):
+        self._assert_training_step_parity(
+            alpha=3,
+            multiplier=1.0,
+            exact=True,
+            device="cuda",
+            base_dtype=torch.bfloat16,
+        )
+
     def test_non_unit_scale_retains_legacy_behavior(self):
         self._assert_training_step_parity(alpha=1.5, multiplier=1.0, exact=True)
 
@@ -157,6 +219,37 @@ class LoRAUnitFastPathParityTest(unittest.TestCase):
             batch_size=2,
             exact=True,
         )
+
+    def test_unit_multiplier_skips_broadcast_multiply(self):
+        base, _, _ = _build_lora(alpha=3, multiplier=1.0)
+        inputs = _deterministic_weight((1, 7, 5), -0.4, 0.5)
+        with patch.object(
+            network_mixins,
+            "broadcast_and_multiply",
+            side_effect=AssertionError("unit multiplier used the legacy path"),
+        ):
+            base(inputs)
+
+    def test_all_one_list_multiplier_skips_broadcast_multiply(self):
+        base, _, _ = _build_lora(alpha=3, multiplier=[1.0, 1.0])
+        inputs = _deterministic_weight((2, 7, 5), -0.4, 0.5)
+        with patch.object(
+            network_mixins,
+            "broadcast_and_multiply",
+            side_effect=AssertionError("all-one multiplier used the legacy path"),
+        ):
+            base(inputs)
+
+    def test_non_unit_multiplier_uses_broadcast_multiply(self):
+        base, _, _ = _build_lora(alpha=3, multiplier=0.5)
+        inputs = _deterministic_weight((1, 7, 5), -0.4, 0.5)
+        with patch.object(
+            network_mixins,
+            "broadcast_and_multiply",
+            wraps=network_mixins.broadcast_and_multiply,
+        ) as multiply:
+            base(inputs)
+        multiply.assert_called_once()
 
 
 if __name__ == "__main__":
