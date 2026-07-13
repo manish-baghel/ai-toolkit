@@ -121,7 +121,31 @@ def _dequantize_fp8_state_dict(
     return out
 
 
-def _load_component_state_dict(base: str, subfolder: str, basename: str) -> dict:
+def _validate_predequantized_bf16_state_dict(state_dict: dict) -> None:
+    scale_keys = [key for key in state_dict if key.endswith(FP8_SCALE_SUFFIX)]
+    if scale_keys:
+        raise ValueError(
+            "Predequantized Ideogram transformer still contains FP8 scale tensors"
+        )
+    wrong_dtype_keys = [
+        key
+        for key, tensor in state_dict.items()
+        if tensor.is_floating_point() and tensor.dtype != torch.bfloat16
+    ]
+    if wrong_dtype_keys:
+        raise ValueError(
+            "Predequantized Ideogram transformer contains non-bfloat16 weights: "
+            + ", ".join(wrong_dtype_keys[:5])
+        )
+
+
+def _load_component_state_dict(
+    base: str,
+    subfolder: str,
+    basename: str,
+    *,
+    device: torch.device | str = "cpu",
+) -> dict:
     """Load a component's weights whether local or on the hub, sharded or single."""
     index_name = f"{basename}.safetensors.index.json"
     single_name = f"{basename}.safetensors"
@@ -131,8 +155,10 @@ def _load_component_state_dict(base: str, subfolder: str, basename: str) -> dict
     if os.path.isdir(local_dir):
         index_path = os.path.join(local_dir, index_name)
         if os.path.exists(index_path):
-            return _load_sharded(local_dir, index_path, is_local=True)
-        return load_file(os.path.join(local_dir, single_name))
+            return _load_sharded(
+                local_dir, index_path, is_local=True, device=device
+            )
+        return load_file(os.path.join(local_dir, single_name), device=str(device))
 
     # Hub repo layout: <subfolder>/<file>
     prefix = f"{subfolder}/" if subfolder else ""
@@ -140,15 +166,27 @@ def _load_component_state_dict(base: str, subfolder: str, basename: str) -> dict
         index_path = huggingface_hub.hf_hub_download(
             repo_id=base, filename=f"{prefix}{index_name}", token=HF_TOKEN
         )
-        return _load_sharded(base, index_path, is_local=False, prefix=prefix)
+        return _load_sharded(
+            base,
+            index_path,
+            is_local=False,
+            prefix=prefix,
+            device=device,
+        )
     except EntryNotFoundError:
         single_path = huggingface_hub.hf_hub_download(
             repo_id=base, filename=f"{prefix}{single_name}", token=HF_TOKEN
         )
-        return load_file(single_path)
+        return load_file(single_path, device=str(device))
 
 
-def _load_sharded(base, index_path, is_local, prefix="") -> dict:
+def _load_sharded(
+    base,
+    index_path,
+    is_local,
+    prefix="",
+    device: torch.device | str = "cpu",
+) -> dict:
     import json
 
     with open(index_path) as f:
@@ -165,7 +203,7 @@ def _load_sharded(base, index_path, is_local, prefix="") -> dict:
                 repo_id=base, filename=f"{prefix}{shard}", token=HF_TOKEN
             )
         print_acc(f"    loading shard {i + 1}/{num_shards}: {shard}")
-        state_dict.update(load_file(shard_path))
+        state_dict.update(load_file(shard_path, device=str(device)))
     return state_dict
 
 
@@ -255,19 +293,38 @@ class Ideogram4Model(BaseModel):
     def _load_transformer(self, base: str):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading transformer")
+        use_predequantized_bf16 = bool(
+            self.model_config.model_kwargs.get(
+                "predequantized_transformer_bf16", False
+            )
+        )
+        if use_predequantized_bf16 and dtype != torch.bfloat16:
+            raise ValueError(
+                "predequantized_transformer_bf16 requires model dtype bfloat16"
+            )
 
         transformer_config = Ideogram4Config()
         with torch.device("meta"):
             transformer = Ideogram4Transformer2DModel(transformer_config)
 
         self.print_and_status_update("  - fetching transformer weights")
+        load_device = "cpu"
+        if use_predequantized_bf16 and not self.model_config.low_vram:
+            load_device = self.device_torch
         state_dict = _load_component_state_dict(
-            base, "transformer", "diffusion_pytorch_model"
+            base,
+            "transformer",
+            "diffusion_pytorch_model",
+            device=load_device,
         )
-        self.print_and_status_update("  - dequantizing transformer weights")
-        state_dict = _dequantize_fp8_state_dict(
-            state_dict, dtype, self.device_torch, self.model_config.low_vram
-        )
+        if use_predequantized_bf16:
+            self.print_and_status_update("  - using baked bfloat16 transformer weights")
+            _validate_predequantized_bf16_state_dict(state_dict)
+        else:
+            self.print_and_status_update("  - dequantizing transformer weights")
+            state_dict = _dequantize_fp8_state_dict(
+                state_dict, dtype, self.device_torch, self.model_config.low_vram
+            )
         self.print_and_status_update("  - loading transformer state dict")
         transformer.load_state_dict(state_dict, assign=True)
         del state_dict
