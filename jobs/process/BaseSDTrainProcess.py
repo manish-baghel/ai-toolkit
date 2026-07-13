@@ -2327,6 +2327,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # make sure all params require grad
         self.ensure_params_requires_grad(force=True)
 
+        if hasattr(self.sd, 'prepare_training_cache'):
+            self.sd.prepare_training_cache(
+                data_loader=self.data_loader,
+                data_loader_reg=self.data_loader_reg,
+                train_config=self.train_config,
+                network_config=self.network_config,
+                network=self.network,
+                adapter=self.adapter,
+                embedding=self.embedding,
+                decorator=self.decorator,
+            )
+
 
         ###################################################################
         # TRAIN LOOP
@@ -2626,6 +2638,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.progress_bar.close()
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
+        if hasattr(self.sd, 'clear_prepared_training_cache'):
+            self.sd.clear_prepared_training_cache()
         if self.accelerator.is_main_process:
             self.save()
         if not self.train_config.disable_sampling:
