@@ -268,6 +268,46 @@ class Ideogram4PreparedContextParityTest(unittest.TestCase):
         )
         self.assertTrue(context.projected_llm_features.requires_grad)
 
+    def test_uncached_forward_preserves_legacy_module_order(self):
+        config = Ideogram4Config(
+            emb_dim=24,
+            num_layers=1,
+            num_heads=3,
+            intermediate_size=32,
+            adanln_dim=8,
+            in_channels=4,
+            llm_features_dim=12,
+            rope_theta=10_000,
+            mrope_section=(1, 1, 1),
+        )
+        model = Ideogram4Transformer2DModel(config)
+        inputs = _inputs(config, device="cpu", dtype=torch.float32)
+        calls = []
+        handles = [
+            model.input_proj.register_forward_pre_hook(
+                lambda *_: calls.append("input_proj")
+            ),
+            model.t_embedding.register_forward_pre_hook(
+                lambda *_: calls.append("t_embedding")
+            ),
+            model.llm_cond_proj.register_forward_pre_hook(
+                lambda *_: calls.append("llm_cond_proj")
+            ),
+        ]
+        try:
+            model(
+                llm_features=inputs[1],
+                x=inputs[0],
+                t=inputs[2],
+                position_ids=inputs[3],
+                segment_ids=inputs[4],
+                indicator=inputs[5],
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertEqual(calls, ["input_proj", "t_embedding", "llm_cond_proj"])
+
 
 if __name__ == "__main__":
     unittest.main()

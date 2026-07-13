@@ -476,13 +476,39 @@ class Ideogram4Transformer2DModel(nn.Module):
           (B, L, in_channels) velocity prediction in float32. Only the positions
           with ``indicator == OUTPUT_IMAGE_INDICATOR`` are meaningful.
         """
-        context = self.prepare_context(
+        _, _, in_channels = x.shape
+        assert in_channels == self.config.in_channels
+
+        param_dtype = self.input_proj.weight.dtype
+        x = x.to(param_dtype)
+        t = t.to(param_dtype)
+        llm_features = llm_features.to(param_dtype)
+
+        indicator = indicator.to(torch.long)
+        llm_token_mask = (
+            (indicator == LLM_TOKEN_INDICATOR)
+            .to(param_dtype)
+            .unsqueeze(-1)
+        )
+        output_image_mask = (
+            (indicator == OUTPUT_IMAGE_INDICATOR)
+            .to(param_dtype)
+            .unsqueeze(-1)
+        )
+
+        # Preserve the legacy module-call order for the ordinary uncached path:
+        # input projection, timestep conditioning, then LLM projection.
+        llm_features = llm_features * llm_token_mask
+        x, adaln_input = self._prepare_dynamic_inputs(x, t, output_image_mask)
+        context = self._prepare_context_from_masked(
             llm_features=llm_features,
+            llm_token_mask=llm_token_mask,
+            output_image_mask=output_image_mask,
             position_ids=position_ids,
             segment_ids=segment_ids,
             indicator=indicator,
         )
-        return self.forward_with_context(x=x, t=t, context=context)
+        return self._forward_blocks(x, adaln_input, context)
 
     def prepare_context(
         self,
@@ -514,6 +540,25 @@ class Ideogram4Transformer2DModel(nn.Module):
         )
 
         llm_features = llm_features * llm_token_mask
+        return self._prepare_context_from_masked(
+            llm_features=llm_features,
+            llm_token_mask=llm_token_mask,
+            output_image_mask=output_image_mask,
+            position_ids=position_ids,
+            segment_ids=segment_ids,
+            indicator=indicator,
+        )
+
+    def _prepare_context_from_masked(
+        self,
+        *,
+        llm_features: torch.Tensor,
+        llm_token_mask: torch.Tensor,
+        output_image_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        segment_ids: torch.Tensor,
+        indicator: torch.Tensor,
+    ) -> Ideogram4TransformerContext:
         llm_features = self.llm_cond_norm(llm_features)
         projected_llm_features = self.llm_cond_proj(llm_features) * llm_token_mask
 
@@ -547,6 +592,23 @@ class Ideogram4Transformer2DModel(nn.Module):
             flash_meta=flash_meta,
         )
 
+    def _prepare_dynamic_inputs(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        output_image_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = x * output_image_mask
+        x = self.input_proj(x) * output_image_mask
+
+        # Keep shape (B, 1, ...) when t is per-sample so downstream adaln_modulation
+        # projections don't pay for L identical copies.
+        t_cond = self.t_embedding(t)
+        if t.dim() == 1:
+            t_cond = t_cond.unsqueeze(1)
+        adaln_input = F.silu(self.adaln_proj(t_cond))
+        return x, adaln_input
+
     def forward_with_context(
         self,
         *,
@@ -555,23 +617,24 @@ class Ideogram4Transformer2DModel(nn.Module):
         context: Ideogram4TransformerContext,
     ) -> torch.Tensor:
         """Run the dynamic noise/timestep path with prepared conditioning."""
-        batch_size, seq_len, in_channels = x.shape
+        _, _, in_channels = x.shape
         assert in_channels == self.config.in_channels
 
         param_dtype = self.input_proj.weight.dtype
         x = x.to(param_dtype)
         t = t.to(param_dtype)
 
-        x = x * context.output_image_mask
-        x = self.input_proj(x) * context.output_image_mask
+        x, adaln_input = self._prepare_dynamic_inputs(
+            x, t, context.output_image_mask
+        )
+        return self._forward_blocks(x, adaln_input, context)
 
-        # Keep shape (B, 1, ...) when t is per-sample so downstream adaln_modulation
-        # projections don't pay for L identical copies.
-        t_cond = self.t_embedding(t)
-        if t.dim() == 1:
-            t_cond = t_cond.unsqueeze(1)
-        adaln_input = F.silu(self.adaln_proj(t_cond))
-
+    def _forward_blocks(
+        self,
+        x: torch.Tensor,
+        adaln_input: torch.Tensor,
+        context: Ideogram4TransformerContext,
+    ) -> torch.Tensor:
         h = x + context.projected_llm_features
         h = h + context.image_indicator_embedding
 
