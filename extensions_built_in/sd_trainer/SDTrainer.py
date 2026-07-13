@@ -2172,7 +2172,7 @@ class SDTrainer(BaseSDTrainProcess):
                 self.adapter.restore_embeddings()
 
         loss_dict = OrderedDict(
-            {'loss': (total_loss / len(batch_list)).item()}
+            {'loss': (total_loss / len(batch_list)).detach()}
         )
 
         self.end_of_training_loop()

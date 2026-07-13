@@ -39,7 +39,11 @@ from toolkit.models.decorator import Decorator
 from toolkit.network_mixins import Network
 from toolkit.optimizer import get_optimizer
 from toolkit.paths import CONFIG_ROOT
-from toolkit.progress_bar import ToolkitProgressBar
+from toolkit.progress_bar import (
+    ToolkitProgressBar,
+    is_progress_update_due,
+    materialize_metrics,
+)
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sampler import get_sampler
 from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adapter_from_diffusers, \
@@ -2470,6 +2474,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # torch.cuda.empty_cache()
                 # if optimizer has get_lrs method, then use it
                 learning_rate = 0.0
+                progress_due = (
+                    self.progress_bar is not None
+                    and is_progress_update_due(
+                        step,
+                        start_step_num,
+                        self.train_config.steps,
+                        self.logging_config.progress_every,
+                    )
+                )
+                log_due = (
+                    self.step_num != self.start_step
+                    and (
+                        self.logging_config.log_every is None
+                        or (
+                            self.logging_config.log_every
+                            and self.step_num % self.logging_config.log_every == 0
+                        )
+                    )
+                )
+                scalar_loss_dict = None
                 if not did_oom and loss_dict is not None:
                     if hasattr(optimizer, 'get_avg_learning_rate'):
                         learning_rate = optimizer.get_avg_learning_rate()
@@ -2484,12 +2508,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
+                    if progress_due or log_due:
+                        scalar_loss_dict = materialize_metrics(loss_dict)
+
+                if progress_due and scalar_loss_dict is not None:
                     prog_bar_string = f"lr: {learning_rate:.1e}"
-                    for key, value in loss_dict.items():
+                    for key, value in scalar_loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
 
-                    if self.progress_bar is not None:
-                        self.progress_bar.set_postfix_str(prog_bar_string)
+                    self.progress_bar.set_postfix_str(prog_bar_string, refresh=False)
 
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
                 if isinstance(batch, DataLoaderBatchDTO):
@@ -2533,15 +2560,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if self.progress_bar is not None:
                             self.progress_bar.unpause()
 
-                    if self.logging_config.log_every and self.step_num % self.logging_config.log_every == 0:
+                    if log_due:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
                         with self.timer('log_to_tensorboard'):
                             # log to tensorboard
                             if self.accelerator.is_main_process:
                                 if self.writer is not None:
-                                    if loss_dict is not None:
-                                        for key, value in loss_dict.items():
+                                    if scalar_loss_dict is not None:
+                                        for key, value in scalar_loss_dict.items():
                                             self.writer.add_scalar(f"{key}", value, self.step_num)
                                         self.writer.add_scalar(f"lr", learning_rate, self.step_num)
                                 if self.progress_bar is not None:
@@ -2552,8 +2579,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             self.logger.log({
                                 'learning_rate': learning_rate,
                             })
-                            if loss_dict is not None:
-                                for key, value in loss_dict.items():
+                            if scalar_loss_dict is not None:
+                                for key, value in scalar_loss_dict.items():
                                     self.logger.log({
                                         f'loss/{key}': value,
                                     })
@@ -2563,24 +2590,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                         key: value,
                                     })
                                 self.additional_logs = {}
-                    elif self.logging_config.log_every is None:
-                        if self.accelerator.is_main_process:
-                            # log every step
-                            self.logger.log({
-                                'learning_rate': learning_rate,
-                            })
-                            for key, value in loss_dict.items():
-                                self.logger.log({
-                                    f'loss/{key}': value,
-                                })
-                            if self.additional_logs is not None:
-                                for key, value in self.additional_logs.items():
-                                    self.logger.log({
-                                        key: value,
-                                    })
-                                self.additional_logs = {}
-
-
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
@@ -2596,8 +2605,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.logger.commit(step=self.step_num)
 
                 # sets progress bar to match out step
-                if self.progress_bar is not None:
-                    self.progress_bar.update(step - self.progress_bar.n)
+                if progress_due:
+                    self.progress_bar.update((step + 1) - self.progress_bar.n)
 
                 #############################
                 # End of step
