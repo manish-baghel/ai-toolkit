@@ -1576,9 +1576,18 @@ class SDTrainer(BaseSDTrainProcess):
                         with torch.set_grad_enabled(False):
                             if batch.prompt_embeds is not None:
                                 # use the cached embeds
-                                conditional_embeds = batch.prompt_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
-                                )
+                                if batch.prepared_training_context is not None:
+                                    # The prepared Ideogram cache owns detached CUDA
+                                    # embeddings for the lifetime of the train loop.
+                                    # Reuse them instead of copying the 53k-wide Qwen
+                                    # features on every step.
+                                    conditional_embeds = batch.prompt_embeds.detach().to(
+                                        self.device_torch, dtype=dtype
+                                    )
+                                else:
+                                    conditional_embeds = batch.prompt_embeds.clone().detach().to(
+                                        self.device_torch, dtype=dtype
+                                    )
                             else:
                                 embeds_to_use = self.cached_blank_embeds.clone().detach().to(
                                     self.device_torch, dtype=dtype
