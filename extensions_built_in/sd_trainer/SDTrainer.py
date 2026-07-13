@@ -1275,6 +1275,7 @@ class SDTrainer(BaseSDTrainProcess):
             rescale_cfg=self.train_config.cfg_rescale,
             bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
             batch=batch,
+            is_primary_pred=is_primary_pred,
             **kwargs
         )
     
