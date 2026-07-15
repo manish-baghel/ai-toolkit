@@ -8,6 +8,7 @@ sampling pipeline used to render preview images during training.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
@@ -23,6 +24,7 @@ from .transformer import (
     QWEN3_VL_ACTIVATION_LAYERS,
     SEQUENCE_PADDING_INDICATOR,
     Ideogram4Transformer2DModel,
+    Ideogram4TransformerContext,
 )
 
 _LOGSNR_MIN = -15.0
@@ -163,6 +165,33 @@ def get_qwen3_vl_features(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class Ideogram4PackedContext:
+    """Latent/timestep-independent inputs for a packed Ideogram sequence."""
+
+    llm_features: torch.Tensor
+    position_ids: torch.Tensor
+    segment_ids: torch.Tensor
+    indicator: torch.Tensor
+    num_text_tokens: int
+    num_image_tokens: int
+    gh: int
+    gw: int
+
+
+@dataclass
+class Ideogram4PreparedVelocityContext:
+    """Reusable projected conditioning and geometry for velocity prediction."""
+
+    transformer_context: Ideogram4TransformerContext
+    num_text_tokens: int
+    num_image_tokens: int
+    batch_size: int
+    gh: int
+    gw: int
+    attention_backend: str
+
+
 def pad_text_features(
     features_list: List[torch.Tensor],
     device: torch.device,
@@ -189,6 +218,97 @@ def pad_text_features(
     return features, mask
 
 
+def prepare_packed_context(
+    llm_features: torch.Tensor,
+    text_mask: torch.Tensor,
+    gh: int,
+    gw: int,
+) -> Ideogram4PackedContext:
+    """Build the static [text | image] conditioning and sequence geometry."""
+    device = llm_features.device
+    b, num_text_tokens, llm_dim = llm_features.shape
+    num_image_tokens = gh * gw
+    seq_len = num_text_tokens + num_image_tokens
+
+    # The mask may arrive as a float (PromptEmbeds.to casts it to the embed
+    # dtype); work in long so cumsum positions stay exact for long prompts.
+    text_mask_bool = text_mask.to(device) > 0
+    text_mask_long = text_mask_bool.long()
+
+    # LLM features: image region is zero.
+    llm_full = torch.cat(
+        [
+            llm_features,
+            torch.zeros(
+                b,
+                num_image_tokens,
+                llm_dim,
+                device=device,
+                dtype=llm_features.dtype,
+            ),
+        ],
+        dim=1,
+    )
+
+    # Indicator: real text -> 3, image -> 2, text pad -> 0.
+    indicator = torch.zeros(b, seq_len, dtype=torch.long, device=device)
+    indicator[:, :num_text_tokens] = text_mask_long * LLM_TOKEN_INDICATOR
+    indicator[:, num_text_tokens:] = OUTPUT_IMAGE_INDICATOR
+
+    # Segment ids: real text + image -> 1, text pad -> -1.
+    segment_ids = torch.ones(b, seq_len, dtype=torch.long, device=device)
+    segment_ids[:, :num_text_tokens] = torch.where(
+        text_mask_bool,
+        torch.ones_like(text_mask_long),
+        torch.full_like(text_mask_long, SEQUENCE_PADDING_INDICATOR),
+    )
+
+    # Position ids (t, h, w). Text uses relative positions; image positions use
+    # a large offset so they cannot collide with text positions.
+    text_pos = (text_mask_long.cumsum(dim=-1) - 1).clamp(min=0)
+    text_pos_3d = text_pos.unsqueeze(-1).expand(-1, -1, 3)
+
+    h_idx = torch.arange(gh, device=device).view(-1, 1).expand(gh, gw).reshape(-1)
+    w_idx = torch.arange(gw, device=device).view(1, -1).expand(gh, gw).reshape(-1)
+    t_idx = torch.zeros_like(h_idx)
+    image_pos = torch.stack([t_idx, h_idx, w_idx], dim=1) + IMAGE_POSITION_OFFSET
+    image_pos_3d = image_pos.unsqueeze(0).expand(b, -1, -1)
+    position_ids = torch.cat([text_pos_3d, image_pos_3d], dim=1)
+
+    return Ideogram4PackedContext(
+        llm_features=llm_full,
+        position_ids=position_ids,
+        segment_ids=segment_ids,
+        indicator=indicator,
+        num_text_tokens=num_text_tokens,
+        num_image_tokens=num_image_tokens,
+        gh=gh,
+        gw=gw,
+    )
+
+
+def pack_latent_tokens(
+    latents: torch.Tensor,
+    num_text_tokens: int,
+) -> torch.Tensor:
+    """Pack dynamic image latents after a zeroed text-token prefix."""
+    b, c, gh, gw = latents.shape
+    image_tokens = latents.permute(0, 2, 3, 1).reshape(b, gh * gw, c)
+    return torch.cat(
+        [
+            torch.zeros(
+                b,
+                num_text_tokens,
+                c,
+                device=latents.device,
+                dtype=image_tokens.dtype,
+            ),
+            image_tokens,
+        ],
+        dim=1,
+    )
+
+
 def predict_velocity(
     transformer: Ideogram4Transformer2DModel,
     latents: torch.Tensor,  # (B, 128, gh, gw)
@@ -206,85 +326,111 @@ def predict_velocity(
     clean) and predicts ``clean - noise``, so we feed it ``1 - t`` and negate its
     output. Returns the velocity reshaped to the (B, 128, gh, gw) latent layout.
     """
-    device = latents.device
+    _, _, gh, gw = latents.shape
+    packed_context = prepare_packed_context(llm_features, text_mask, gh, gw)
+    return predict_velocity_with_context(transformer, latents, t, packed_context)
+
+
+def predict_velocity_with_context(
+    transformer: Ideogram4Transformer2DModel,
+    latents: torch.Tensor,
+    t: torch.Tensor,
+    packed_context: Ideogram4PackedContext,
+) -> torch.Tensor:
+    """Predict velocity while reusing an already packed static context."""
     b, c, gh, gw = latents.shape
-    num_image_tokens = gh * gw
-    num_text_tokens = llm_features.shape[1]
-    seq_len = num_text_tokens + num_image_tokens
+    if packed_context.gh != gh or packed_context.gw != gw:
+        raise ValueError("Packed Ideogram context does not match latent geometry")
+    if packed_context.llm_features.shape[0] != b:
+        raise ValueError("Packed Ideogram context does not match latent batch size")
 
-    # image latents -> tokens (row-major: h outer, w inner)
-    image_tokens = latents.permute(0, 2, 3, 1).reshape(b, num_image_tokens, c)
-
-    # The mask may arrive as a float (PromptEmbeds.to casts it to the embed
-    # dtype); work in long so cumsum positions stay exact for long prompts.
-    text_mask_bool = text_mask.to(device) > 0
-    text_mask_long = text_mask_bool.long()
-
-    # noise tokens: text region is zeroed (masked out anyway)
-    x = torch.cat(
-        [
-            torch.zeros(b, num_text_tokens, c, device=device, dtype=image_tokens.dtype),
-            image_tokens,
-        ],
-        dim=1,
-    )
-
-    # llm features: image region is zero
-    llm_full = torch.cat(
-        [
-            llm_features,
-            torch.zeros(
-                b,
-                num_image_tokens,
-                llm_features.shape[-1],
-                device=device,
-                dtype=llm_features.dtype,
-            ),
-        ],
-        dim=1,
-    )
-
-    # indicator: real text -> 3, image -> 2, text pad -> 0
-    indicator = torch.zeros(b, seq_len, dtype=torch.long, device=device)
-    indicator[:, :num_text_tokens] = text_mask_long * LLM_TOKEN_INDICATOR
-    indicator[:, num_text_tokens:] = OUTPUT_IMAGE_INDICATOR
-
-    # segment ids: real text + image -> 1, text pad -> -1 (its own padding segment)
-    segment_ids = torch.ones(b, seq_len, dtype=torch.long, device=device)
-    segment_ids[:, :num_text_tokens] = torch.where(
-        text_mask_bool,
-        torch.ones_like(text_mask_long),
-        torch.full_like(text_mask_long, SEQUENCE_PADDING_INDICATOR),
-    )
-
-    # position ids (t, h, w)
-    # text positions: 0..num_real-1 at the real slots (relative; pad -> 0)
-    text_pos = (text_mask_long.cumsum(dim=-1) - 1).clamp(min=0)  # (B, Lt)
-    text_pos_3d = text_pos.unsqueeze(-1).expand(-1, -1, 3)
-
-    h_idx = torch.arange(gh, device=device).view(-1, 1).expand(gh, gw).reshape(-1)
-    w_idx = torch.arange(gw, device=device).view(1, -1).expand(gh, gw).reshape(-1)
-    t_idx = torch.zeros_like(h_idx)
-    image_pos = torch.stack([t_idx, h_idx, w_idx], dim=1) + IMAGE_POSITION_OFFSET
-    image_pos_3d = image_pos.unsqueeze(0).expand(b, -1, -1)
-
-    position_ids = torch.cat([text_pos_3d, image_pos_3d], dim=1)
+    x = pack_latent_tokens(latents, packed_context.num_text_tokens)
 
     # Flip into the model's time convention (t=1 -> clean).
     model_t = 1.0 - t
 
     out = transformer(
-        llm_features=llm_full,
+        llm_features=packed_context.llm_features,
         x=x,
         t=model_t,
-        position_ids=position_ids,
-        segment_ids=segment_ids,
-        indicator=indicator,
+        position_ids=packed_context.position_ids,
+        segment_ids=packed_context.segment_ids,
+        indicator=packed_context.indicator,
     )
 
-    image_velocity = out[:, num_text_tokens:]  # (B, Li, 128)
+    image_velocity = out[:, packed_context.num_text_tokens:]  # (B, Li, 128)
     image_velocity = image_velocity.reshape(b, gh, gw, c).permute(0, 3, 1, 2)
     # Model predicts clean - noise; negate to return toolkit velocity (noise - clean).
+    return -image_velocity
+
+
+def prepare_velocity_context(
+    transformer: Ideogram4Transformer2DModel,
+    llm_features: torch.Tensor,
+    text_mask: torch.Tensor,
+    gh: int,
+    gw: int,
+    *,
+    detach: bool = False,
+) -> Ideogram4PreparedVelocityContext:
+    """Project conditioning and build static geometry once for repeated steps.
+
+    ``detach=True`` is intended for training caches whose preparation modules
+    are frozen. Eligibility for that mode is enforced by the Ideogram model
+    integration, where the active LoRA scope is known.
+    """
+    packed_context = prepare_packed_context(llm_features, text_mask, gh, gw)
+
+    if detach:
+        with torch.no_grad():
+            transformer_context = transformer.prepare_context(
+                llm_features=packed_context.llm_features,
+                position_ids=packed_context.position_ids,
+                segment_ids=packed_context.segment_ids,
+                indicator=packed_context.indicator,
+            )
+    else:
+        transformer_context = transformer.prepare_context(
+            llm_features=packed_context.llm_features,
+            position_ids=packed_context.position_ids,
+            segment_ids=packed_context.segment_ids,
+            indicator=packed_context.indicator,
+        )
+
+    return Ideogram4PreparedVelocityContext(
+        transformer_context=transformer_context,
+        num_text_tokens=packed_context.num_text_tokens,
+        num_image_tokens=packed_context.num_image_tokens,
+        batch_size=packed_context.llm_features.shape[0],
+        gh=gh,
+        gw=gw,
+        attention_backend=transformer.attention_backend,
+    )
+
+
+def predict_velocity_with_prepared_context(
+    transformer: Ideogram4Transformer2DModel,
+    latents: torch.Tensor,
+    t: torch.Tensor,
+    prepared_context: Ideogram4PreparedVelocityContext,
+) -> torch.Tensor:
+    """Predict velocity without rebuilding frozen conditioning or geometry."""
+    b, c, gh, gw = latents.shape
+    if prepared_context.gh != gh or prepared_context.gw != gw:
+        raise ValueError("Prepared Ideogram context does not match latent geometry")
+    if prepared_context.batch_size != b:
+        raise ValueError("Prepared Ideogram context does not match latent batch size")
+    if prepared_context.attention_backend != transformer.attention_backend:
+        raise ValueError("Prepared Ideogram context uses a different attention backend")
+
+    x = pack_latent_tokens(latents, prepared_context.num_text_tokens)
+    out = transformer.forward_with_context(
+        x=x,
+        t=1.0 - t,
+        context=prepared_context.transformer_context,
+    )
+    image_velocity = out[:, prepared_context.num_text_tokens:]
+    image_velocity = image_velocity.reshape(b, gh, gw, c).permute(0, 3, 1, 2)
     return -image_velocity
 
 

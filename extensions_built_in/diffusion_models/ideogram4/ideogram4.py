@@ -1,4 +1,6 @@
+import hashlib
 import os
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
@@ -7,7 +9,7 @@ from safetensors.torch import load_file, save_file
 
 from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
 from toolkit.models.base_model import BaseModel
-from toolkit.lora_special import LoRASpecialNetwork
+from toolkit.lora_special import LoRAModule, LoRASpecialNetwork
 from toolkit.basic import flush
 from toolkit.print import print_acc
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
@@ -34,6 +36,8 @@ from .src.pipeline import (
     pad_text_features,
     patchify_latents,
     predict_velocity,
+    predict_velocity_with_prepared_context,
+    prepare_velocity_context,
     unpatchify_latents,
 )
 
@@ -63,6 +67,13 @@ FP8_SCALE_SUFFIX = ".weight_scale"
 QWEN3_VL_PATH = "Qwen/Qwen3-VL-8B-Instruct"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
+
+
+@dataclass
+class Ideogram4PreparedTrainingInput:
+    latent: torch.Tensor
+    prompt_embeds: AdvancedPromptEmbeds
+    context: object
 
 
 def _dequantize_fp8_state_dict(
@@ -110,7 +121,31 @@ def _dequantize_fp8_state_dict(
     return out
 
 
-def _load_component_state_dict(base: str, subfolder: str, basename: str) -> dict:
+def _validate_predequantized_bf16_state_dict(state_dict: dict) -> None:
+    scale_keys = [key for key in state_dict if key.endswith(FP8_SCALE_SUFFIX)]
+    if scale_keys:
+        raise ValueError(
+            "Predequantized Ideogram transformer still contains FP8 scale tensors"
+        )
+    wrong_dtype_keys = [
+        key
+        for key, tensor in state_dict.items()
+        if tensor.is_floating_point() and tensor.dtype != torch.bfloat16
+    ]
+    if wrong_dtype_keys:
+        raise ValueError(
+            "Predequantized Ideogram transformer contains non-bfloat16 weights: "
+            + ", ".join(wrong_dtype_keys[:5])
+        )
+
+
+def _load_component_state_dict(
+    base: str,
+    subfolder: str,
+    basename: str,
+    *,
+    device: torch.device | str = "cpu",
+) -> dict:
     """Load a component's weights whether local or on the hub, sharded or single."""
     index_name = f"{basename}.safetensors.index.json"
     single_name = f"{basename}.safetensors"
@@ -120,8 +155,10 @@ def _load_component_state_dict(base: str, subfolder: str, basename: str) -> dict
     if os.path.isdir(local_dir):
         index_path = os.path.join(local_dir, index_name)
         if os.path.exists(index_path):
-            return _load_sharded(local_dir, index_path, is_local=True)
-        return load_file(os.path.join(local_dir, single_name))
+            return _load_sharded(
+                local_dir, index_path, is_local=True, device=device
+            )
+        return load_file(os.path.join(local_dir, single_name), device=str(device))
 
     # Hub repo layout: <subfolder>/<file>
     prefix = f"{subfolder}/" if subfolder else ""
@@ -129,15 +166,27 @@ def _load_component_state_dict(base: str, subfolder: str, basename: str) -> dict
         index_path = huggingface_hub.hf_hub_download(
             repo_id=base, filename=f"{prefix}{index_name}", token=HF_TOKEN
         )
-        return _load_sharded(base, index_path, is_local=False, prefix=prefix)
+        return _load_sharded(
+            base,
+            index_path,
+            is_local=False,
+            prefix=prefix,
+            device=device,
+        )
     except EntryNotFoundError:
         single_path = huggingface_hub.hf_hub_download(
             repo_id=base, filename=f"{prefix}{single_name}", token=HF_TOKEN
         )
-        return load_file(single_path)
+        return load_file(single_path, device=str(device))
 
 
-def _load_sharded(base, index_path, is_local, prefix="") -> dict:
+def _load_sharded(
+    base,
+    index_path,
+    is_local,
+    prefix="",
+    device: torch.device | str = "cpu",
+) -> dict:
     import json
 
     with open(index_path) as f:
@@ -154,7 +203,7 @@ def _load_sharded(base, index_path, is_local, prefix="") -> dict:
                 repo_id=base, filename=f"{prefix}{shard}", token=HF_TOKEN
             )
         print_acc(f"    loading shard {i + 1}/{num_shards}: {shard}")
-        state_dict.update(load_file(shard_path))
+        state_dict.update(load_file(shard_path, device=str(device)))
     return state_dict
 
 
@@ -186,6 +235,18 @@ class Ideogram4Model(BaseModel):
         self.max_text_length = int(
             self.model_config.model_kwargs.get("max_text_length", 3072)
         )
+        self.use_prepared_training_cache = bool(
+            self.model_config.model_kwargs.get(
+                "cache_prepared_training_inputs", False
+            )
+        )
+        self._prepared_training_cache: dict[
+            str, Ideogram4PreparedTrainingInput
+        ] = {}
+        self._prepared_text_embedding_cache: dict[
+            str, AdvancedPromptEmbeds
+        ] = {}
+        self._prepared_training_file_items: List[object] = []
 
         self._latent_shift = None
         self._latent_scale = None
@@ -232,19 +293,38 @@ class Ideogram4Model(BaseModel):
     def _load_transformer(self, base: str):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading transformer")
+        use_predequantized_bf16 = bool(
+            self.model_config.model_kwargs.get(
+                "predequantized_transformer_bf16", False
+            )
+        )
+        if use_predequantized_bf16 and dtype != torch.bfloat16:
+            raise ValueError(
+                "predequantized_transformer_bf16 requires model dtype bfloat16"
+            )
 
         transformer_config = Ideogram4Config()
         with torch.device("meta"):
             transformer = Ideogram4Transformer2DModel(transformer_config)
 
         self.print_and_status_update("  - fetching transformer weights")
+        load_device = "cpu"
+        if use_predequantized_bf16 and not self.model_config.low_vram:
+            load_device = self.device_torch
         state_dict = _load_component_state_dict(
-            base, "transformer", "diffusion_pytorch_model"
+            base,
+            "transformer",
+            "diffusion_pytorch_model",
+            device=load_device,
         )
-        self.print_and_status_update("  - dequantizing transformer weights")
-        state_dict = _dequantize_fp8_state_dict(
-            state_dict, dtype, self.device_torch, self.model_config.low_vram
-        )
+        if use_predequantized_bf16:
+            self.print_and_status_update("  - using baked bfloat16 transformer weights")
+            _validate_predequantized_bf16_state_dict(state_dict)
+        else:
+            self.print_and_status_update("  - dequantizing transformer weights")
+            state_dict = _dequantize_fp8_state_dict(
+                state_dict, dtype, self.device_torch, self.model_config.low_vram
+            )
         self.print_and_status_update("  - loading transformer state dict")
         transformer.load_state_dict(state_dict, assign=True)
         del state_dict
@@ -472,11 +552,257 @@ class Ideogram4Model(BaseModel):
     # ------------------------------------------------------------------
     # Training hooks
     # ------------------------------------------------------------------
+    def _prepared_training_cache_incompatibilities(
+        self,
+        *,
+        data_loader,
+        data_loader_reg,
+        train_config,
+        network_config,
+        network,
+        adapter,
+        embedding,
+        decorator,
+    ) -> List[str]:
+        reasons = []
+        transformer = unwrap_model(self.transformer)
+        transformer_block_module_ids = {
+            id(module)
+            for block in transformer.layers
+            for module in block.modules()
+        }
+        if data_loader is None:
+            reasons.append("a training dataset is required")
+        if data_loader_reg is not None:
+            reasons.append("regularization datasets are not supported")
+        if train_config.batch_size != 1:
+            reasons.append("batch_size must be 1")
+        if train_config.gradient_accumulation != 1:
+            reasons.append("gradient_accumulation must be 1")
+        if train_config.train_text_encoder:
+            reasons.append("text encoder training must be disabled")
+        if train_config.do_cfg or train_config.do_random_cfg:
+            reasons.append("training CFG must be disabled")
+        if train_config.short_and_long_captions:
+            reasons.append("short_and_long_captions must be disabled")
+        if train_config.short_and_long_captions_encoder_split:
+            reasons.append("caption encoder splitting must be disabled")
+        if train_config.single_item_batching:
+            reasons.append("single_item_batching must be disabled")
+        if train_config.prompt_dropout_prob != 0.0:
+            reasons.append("prompt_dropout_prob must be 0")
+        if train_config.adapter_assist_name_or_path is not None:
+            reasons.append("adapter assistance is not supported")
+        if adapter is not None or embedding is not None or decorator is not None:
+            reasons.append("adapters, embeddings, and decorators are not supported")
+        if self.model_config.compile:
+            reasons.append("torch.compile must be disabled")
+        if self.model_config.layer_offloading:
+            reasons.append("layer offloading must be disabled")
+
+        if network_config is None or network is None:
+            reasons.append("a LoRA network is required")
+        else:
+            if network_config.type.lower() != "lora":
+                reasons.append("only the standard LoRA network is supported")
+            if not network_config.transformer_only:
+                reasons.append("network.transformer_only must be true")
+            if type(network) is not LoRASpecialNetwork:
+                reasons.append("only LoRASpecialNetwork is supported")
+            else:
+                if network.text_encoder_loras:
+                    reasons.append("text encoder LoRA modules are not supported")
+                if not network.unet_loras:
+                    reasons.append("the LoRA network has no transformer modules")
+                if any(
+                    type(lora) is not LoRAModule
+                    or lora.orig_module_ref() is None
+                    or id(lora.orig_module_ref()) not in transformer_block_module_ids
+                    for lora in network.unet_loras
+                ):
+                    reasons.append("all LoRA modules must be inside transformer layers")
+
+        static_modules = (
+            transformer.llm_cond_norm,
+            transformer.llm_cond_proj,
+            transformer.embed_image_indicator,
+            transformer.rotary_emb,
+        )
+        if any(
+            parameter.requires_grad
+            for module in static_modules
+            for parameter in module.parameters()
+        ):
+            reasons.append("prepared conditioning modules must be frozen")
+
+        if data_loader is not None:
+            from toolkit.data_loader import get_dataloader_datasets
+
+            for dataset in get_dataloader_datasets(data_loader):
+                config = dataset.dataset_config
+                if not config.cache_latents:
+                    reasons.append("all datasets must cache latents in memory")
+                if not config.cache_text_embeddings:
+                    reasons.append("all datasets must cache text embeddings")
+                if config.load_image_when_caching_latents:
+                    reasons.append("raw image loading with cached latents is unsupported")
+                if config.random_crop or config.random_scale:
+                    reasons.append("random crop and random scale are unsupported")
+                if config.shuffle_tokens or config.random_triggers:
+                    reasons.append("randomized caption processing is unsupported")
+                if config.augments or config.augmentations:
+                    reasons.append("dataset augmentations are unsupported")
+                if any(
+                    getattr(config, name, None) is not None
+                    for name in (
+                        "control_path",
+                        "inpaint_path",
+                        "mask_path",
+                        "unconditional_path",
+                        "clip_image_path",
+                    )
+                ):
+                    reasons.append("auxiliary dataset images are unsupported")
+                if config.use_short_captions:
+                    reasons.append("short captions are unsupported")
+                if any(
+                    not item.is_latent_cached or not item.is_text_embedding_cached
+                    for item in dataset.file_list
+                ):
+                    reasons.append("dataset caches must be populated before preparation")
+
+        return list(dict.fromkeys(reasons))
+
+    def prepare_training_cache(
+        self,
+        *,
+        data_loader,
+        data_loader_reg,
+        train_config,
+        network_config,
+        network,
+        adapter,
+        embedding,
+        decorator,
+    ) -> None:
+        if not self.use_prepared_training_cache:
+            return
+
+        reasons = self._prepared_training_cache_incompatibilities(
+            data_loader=data_loader,
+            data_loader_reg=data_loader_reg,
+            train_config=train_config,
+            network_config=network_config,
+            network=network,
+            adapter=adapter,
+            embedding=embedding,
+            decorator=decorator,
+        )
+        if reasons:
+            raise ValueError(
+                "Cannot enable Ideogram prepared training cache: "
+                + "; ".join(reasons)
+            )
+
+        from toolkit.data_loader import get_dataloader_datasets
+
+        transformer = unwrap_model(self.transformer)
+        prepared_cache = {}
+        text_embedding_cache = {}
+        assignments = []
+        print_acc("Preparing Ideogram training inputs on GPU")
+
+        with torch.no_grad():
+            for dataset in get_dataloader_datasets(data_loader):
+                for file_item in dataset.file_list:
+                    latent_path = file_item.get_latent_path(recalculate=True)
+                    text_embedding_path = file_item.get_text_embedding_path(
+                        recalculate=True
+                    )
+                    cache_key = hashlib.sha256(
+                        f"{latent_path}\0{text_embedding_path}".encode("utf-8")
+                    ).hexdigest()
+                    assignments.append((file_item, cache_key))
+                    if cache_key in prepared_cache:
+                        continue
+
+                    prompt_embeds = text_embedding_cache.get(text_embedding_path)
+                    if prompt_embeds is None:
+                        prompt_embeds = AdvancedPromptEmbeds.load(
+                            text_embedding_path
+                        ).to(self.device_torch, dtype=self.torch_dtype)
+                        text_embedding_cache[text_embedding_path] = prompt_embeds
+
+                    latent = file_item.get_latent().unsqueeze(0).to(
+                        self.device_torch, dtype=self.torch_dtype
+                    )
+                    _, _, gh, gw = latent.shape
+                    llm_features, text_mask = pad_text_features(
+                        prompt_embeds.text_embeds,
+                        self.device_torch,
+                        self.torch_dtype,
+                    )
+                    context = prepare_velocity_context(
+                        transformer,
+                        llm_features,
+                        text_mask,
+                        gh,
+                        gw,
+                        detach=True,
+                    )
+                    prepared_cache[cache_key] = Ideogram4PreparedTrainingInput(
+                        latent=latent,
+                        prompt_embeds=prompt_embeds,
+                        context=context,
+                    )
+
+        # Publish only after every item prepared successfully. Until this point
+        # the dataloader remains on its original CPU-cache path.
+        self._prepared_training_cache = prepared_cache
+        self._prepared_text_embedding_cache = text_embedding_cache
+        self._prepared_training_file_items = [
+            file_item for file_item, _ in assignments
+        ]
+        for file_item, cache_key in assignments:
+            file_item._ideogram4_prepared_cache_key = cache_key
+        print_acc(
+            f"Prepared {len(prepared_cache)} Ideogram training inputs "
+            f"({len(text_embedding_cache)} unique text embeddings) on GPU"
+        )
+
+    def get_prepared_training_inputs(self, file_items):
+        if not self.use_prepared_training_cache:
+            return None
+        if len(file_items) != 1:
+            raise ValueError("Ideogram prepared training cache requires batch_size=1")
+        cache_key = getattr(
+            file_items[0], "_ideogram4_prepared_cache_key", None
+        )
+        if cache_key is None or cache_key not in self._prepared_training_cache:
+            raise RuntimeError("Ideogram prepared training input is missing")
+        prepared = self._prepared_training_cache[cache_key]
+        return {
+            "latents": prepared.latent,
+            "prompt_embeds": prepared.prompt_embeds,
+            "context": prepared.context,
+        }
+
+    def clear_prepared_training_cache(self) -> None:
+        for file_item in self._prepared_training_file_items:
+            if hasattr(file_item, "_ideogram4_prepared_cache_key"):
+                del file_item._ideogram4_prepared_cache_key
+        self._prepared_training_file_items.clear()
+        self._prepared_training_cache.clear()
+        self._prepared_text_embedding_cache.clear()
+        self.use_prepared_training_cache = False
+
     def get_noise_prediction(
         self,
         latent_model_input: torch.Tensor,  # (B, 128, gh, gw)
         timestep: torch.Tensor,  # 0 to 1000 scale
         text_embeddings: AdvancedPromptEmbeds,
+        batch=None,
+        is_primary_pred: bool = False,
         **kwargs,
     ):
         if self.model.device == torch.device("cpu"):
@@ -488,18 +814,31 @@ class Ideogram4Model(BaseModel):
         if t01.shape[0] != latent_model_input.shape[0]:
             t01 = t01.expand(latent_model_input.shape[0])
 
-        # Pad the per-sample caption features to the batch max here.
-        llm_features, text_mask = pad_text_features(
-            text_embeddings.text_embeds, self.device_torch, self.torch_dtype
+        prepared_context = (
+            getattr(batch, "prepared_training_context", None)
+            if is_primary_pred and batch is not None
+            else None
         )
+        if prepared_context is not None:
+            pred = predict_velocity_with_prepared_context(
+                unwrap_model(self.transformer),
+                latent_model_input.to(self.device_torch),
+                t01,
+                prepared_context,
+            )
+        else:
+            # Pad the per-sample caption features to the batch max here.
+            llm_features, text_mask = pad_text_features(
+                text_embeddings.text_embeds, self.device_torch, self.torch_dtype
+            )
 
-        pred = predict_velocity(
-            self.transformer,
-            latent_model_input.to(self.device_torch),
-            t01,
-            llm_features,
-            text_mask,
-        )
+            pred = predict_velocity(
+                self.transformer,
+                latent_model_input.to(self.device_torch),
+                t01,
+                llm_features,
+                text_mask,
+            )
         return pred
 
     def get_prompt_embeds(self, prompt) -> AdvancedPromptEmbeds:

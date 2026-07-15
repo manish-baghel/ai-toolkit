@@ -178,6 +178,12 @@ class DataLoaderBatchDTO:
     def __init__(self, **kwargs):
         try:
             self.file_items: List["FileItemDTO"] = kwargs.get("file_items", None)
+            prepared_training_inputs = kwargs.get("prepared_training_inputs", None)
+            self.prepared_training_context = (
+                prepared_training_inputs["context"]
+                if prepared_training_inputs is not None
+                else None
+            )
             is_latents_cached = self.file_items[0].is_latent_cached
             self.tensor: Union[torch.Tensor, None] = None
             self.latents: Union[torch.Tensor, None] = None
@@ -222,10 +228,13 @@ class DataLoaderBatchDTO:
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
             if is_latents_cached:
-                # this get_latent call with trigger loading all cached items from the disk
-                self.latents = torch.cat(
-                    [x.get_latent().unsqueeze(0) for x in self.file_items]
-                )
+                if prepared_training_inputs is not None:
+                    self.latents = prepared_training_inputs["latents"]
+                else:
+                    # this get_latent call with trigger loading all cached items from the disk
+                    self.latents = torch.cat(
+                        [x.get_latent().unsqueeze(0) for x in self.file_items]
+                    )
                 if any(
                     [x._cached_first_frame_latent is not None for x in self.file_items]
                 ):
@@ -251,7 +260,11 @@ class DataLoaderBatchDTO:
                         ]
                     )
 
-            self.prompt_embeds: Union[PromptEmbeds, None] = None
+            self.prompt_embeds: Union[PromptEmbeds, None] = (
+                prepared_training_inputs["prompt_embeds"]
+                if prepared_training_inputs is not None
+                else None
+            )
             # if self.file_items[0].control_tensor is not None:
             # if any have a control tensor, we concatenate them
             if any([x.control_tensor is not None for x in self.file_items]):
@@ -400,7 +413,9 @@ class DataLoaderBatchDTO:
                             "clip_image_embeds_unconditional is None for some file items"
                         )
 
-            if any([x.prompt_embeds is not None for x in self.file_items]):
+            if self.prompt_embeds is None and any(
+                [x.prompt_embeds is not None for x in self.file_items]
+            ):
                 # find one to use as a base
                 base_prompt_embeds = None
                 for x in self.file_items:
@@ -458,6 +473,8 @@ class DataLoaderBatchDTO:
         return [x.caption_short for x in self.file_items]
 
     def cleanup(self):
+        self.prepared_training_context = None
+        self.prompt_embeds = None
         del self.latents
         del self.tensor
         del self.control_tensor

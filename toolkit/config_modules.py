@@ -35,6 +35,9 @@ class SaveConfig:
 class LoggingConfig:
     def __init__(self, **kwargs):
         self.log_every: int = kwargs.get('log_every', 100)
+        self.progress_every: int = int(kwargs.get('progress_every', 20))
+        if self.progress_every < 1:
+            raise ValueError("progress_every must be at least 1")
         self.verbose: bool = kwargs.get('verbose', False)
         self.use_wandb: bool = kwargs.get('use_wandb', False)
         self.use_ui_logger: bool = kwargs.get('use_ui_logger', False)

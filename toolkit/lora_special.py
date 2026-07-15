@@ -123,6 +123,11 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
         self.scale = alpha / self.lora_dim
+        # ``scalar`` above is a fixed tensor equal to one for standard LoRA.
+        # ToolkitModuleMixin can therefore omit the scale multiply when alpha
+        # also equals rank. LyCORIS modules do not set this flag because their
+        # scalar can be trainable.
+        self._has_fixed_unit_scale = bool(self.scale == 1.0)
         self.register_buffer("alpha", torch.tensor(alpha))  # 定数として扱える
 
         # same as microsoft's
@@ -769,5 +774,4 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 all_params.append({"lr": unet_lr, "params": list(self.unet_conv_out.parameters())})
 
         return all_params
-
 

@@ -798,6 +798,7 @@ class BaseModel:
             guidance_embedding_scale=1.0,
             bypass_guidance_embedding=False,
             batch: Union[None, 'DataLoaderBatchDTO'] = None,
+            is_primary_pred: bool = False,
             **kwargs,
     ):
         conditional_pred = None
@@ -928,6 +929,8 @@ class BaseModel:
             kwargs['bypass_guidance_embedding'] = bypass_guidance_embedding
         if 'batch' in signatures:
             kwargs['batch'] = batch
+        if 'is_primary_pred' in signatures:
+            kwargs['is_primary_pred'] = is_primary_pred
 
         noise_pred = self.get_noise_prediction(
             latent_model_input=latent_model_input,

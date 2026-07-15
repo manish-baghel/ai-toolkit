@@ -624,7 +624,30 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         return random.randint(0, len(self.file_list) - 1)
 
     def _get_single_item(self, index, _attempts=0) -> 'FileItemDTO':
-        file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
+        source_file_item: 'FileItemDTO' = self.file_list[index]
+        prepared_cache_key = getattr(
+            source_file_item, "_ideogram4_prepared_cache_key", None
+        )
+        if prepared_cache_key is not None:
+            # Keep all mutable metadata isolated, but do not clone the large CPU
+            # latent that the model-owned GPU cache replaces for this path.
+            memo = {
+                id(value): value
+                for value in (
+                    source_file_item._encoded_latent,
+                    source_file_item._cached_first_frame_latent,
+                    source_file_item._cached_audio_latent,
+                )
+                if value is not None
+            }
+            file_item = copy.deepcopy(source_file_item, memo)
+            file_item._encoded_latent = None
+            file_item._cached_first_frame_latent = None
+            file_item._cached_audio_latent = None
+            file_item.load_caption(self.caption_dict)
+            return file_item
+
+        file_item: 'FileItemDTO' = copy.deepcopy(source_file_item)
         try:
             file_item.load_and_process_image(self.transform)
         except Exception as e:
@@ -693,9 +716,13 @@ def get_dataloader_from_datasets(
     # todo and evenly distribute reg images
 
     def dto_collation(batch: List['FileItemDTO']):
+        prepared_training_inputs = None
+        if getattr(sd, "use_prepared_training_cache", False):
+            prepared_training_inputs = sd.get_prepared_training_inputs(batch)
         # create DTO batch
         batch = DataLoaderBatchDTO(
-            file_items=batch
+            file_items=batch,
+            prepared_training_inputs=prepared_training_inputs,
         )
         return batch
 
@@ -703,7 +730,11 @@ def get_dataloader_from_datasets(
 
     dataloader_kwargs = {}
     
-    if is_native_windows() or is_macos():
+    if getattr(sd, "use_prepared_training_cache", False):
+        # CUDA tensors and prepared transformer contexts stay owned by the main
+        # process. Worker processes must not fork or pickle this cache.
+        dataloader_kwargs['num_workers'] = 0
+    elif is_native_windows() or is_macos():
         dataloader_kwargs['num_workers'] = 0
     else:
         dataloader_kwargs['num_workers'] = dataset_config_list[0].num_workers

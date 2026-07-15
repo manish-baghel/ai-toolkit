@@ -1281,6 +1281,7 @@ class SDTrainer(BaseSDTrainProcess):
             rescale_cfg=self.train_config.cfg_rescale,
             bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
             batch=batch,
+            is_primary_pred=is_primary_pred,
             **kwargs
         )
     
@@ -2178,7 +2179,7 @@ class SDTrainer(BaseSDTrainProcess):
                 self.adapter.restore_embeddings()
 
         loss_dict = OrderedDict(
-            {'loss': (total_loss / len(batch_list)).item()}
+            {'loss': (total_loss / len(batch_list)).detach()}
         )
 
         self.end_of_training_loop()

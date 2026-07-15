@@ -61,6 +61,19 @@ class Ideogram4Config:
     norm_eps: float = 1e-5
 
 
+@dataclass
+class Ideogram4TransformerContext:
+    """Timestep-independent inputs shared by transformer training forwards."""
+
+    projected_llm_features: torch.Tensor
+    output_image_mask: torch.Tensor
+    image_indicator_embedding: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+    attn_mask: torch.Tensor | None
+    flash_meta: tuple[torch.Tensor, int, torch.Tensor, torch.Tensor] | None
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     x1 = x[..., :half]
@@ -463,7 +476,7 @@ class Ideogram4Transformer2DModel(nn.Module):
           (B, L, in_channels) velocity prediction in float32. Only the positions
           with ``indicator == OUTPUT_IMAGE_INDICATOR`` are meaningful.
         """
-        batch_size, seq_len, in_channels = x.shape
+        _, _, in_channels = x.shape
         assert in_channels == self.config.in_channels
 
         param_dtype = self.input_proj.weight.dtype
@@ -472,36 +485,90 @@ class Ideogram4Transformer2DModel(nn.Module):
         llm_features = llm_features.to(param_dtype)
 
         indicator = indicator.to(torch.long)
-        llm_token_mask = (indicator == LLM_TOKEN_INDICATOR).to(x.dtype).unsqueeze(-1)
+        llm_token_mask = (
+            (indicator == LLM_TOKEN_INDICATOR)
+            .to(param_dtype)
+            .unsqueeze(-1)
+        )
         output_image_mask = (
-            (indicator == OUTPUT_IMAGE_INDICATOR).to(x.dtype).unsqueeze(-1)
+            (indicator == OUTPUT_IMAGE_INDICATOR)
+            .to(param_dtype)
+            .unsqueeze(-1)
+        )
+
+        # Preserve the legacy module-call order for the ordinary uncached path:
+        # input projection, timestep conditioning, then LLM projection.
+        llm_features = llm_features * llm_token_mask
+        x, adaln_input = self._prepare_dynamic_inputs(x, t, output_image_mask)
+        context = self._prepare_context_from_masked(
+            llm_features=llm_features,
+            llm_token_mask=llm_token_mask,
+            output_image_mask=output_image_mask,
+            position_ids=position_ids,
+            segment_ids=segment_ids,
+            indicator=indicator,
+        )
+        return self._forward_blocks(x, adaln_input, context)
+
+    def prepare_context(
+        self,
+        *,
+        llm_features: torch.Tensor,
+        position_ids: torch.Tensor,
+        segment_ids: torch.Tensor,
+        indicator: torch.Tensor,
+    ) -> Ideogram4TransformerContext:
+        """Prepare the portion of a forward that does not depend on noise/time.
+
+        This method does not detach or cache anything. Keeping preparation as a
+        first-class operation lets the training integration cache it later only
+        when the conditioning modules are known to be frozen.
+        """
+        param_dtype = self.input_proj.weight.dtype
+        llm_features = llm_features.to(param_dtype)
+
+        indicator = indicator.to(torch.long)
+        llm_token_mask = (
+            (indicator == LLM_TOKEN_INDICATOR)
+            .to(param_dtype)
+            .unsqueeze(-1)
+        )
+        output_image_mask = (
+            (indicator == OUTPUT_IMAGE_INDICATOR)
+            .to(param_dtype)
+            .unsqueeze(-1)
         )
 
         llm_features = llm_features * llm_token_mask
-        x = x * output_image_mask
+        return self._prepare_context_from_masked(
+            llm_features=llm_features,
+            llm_token_mask=llm_token_mask,
+            output_image_mask=output_image_mask,
+            position_ids=position_ids,
+            segment_ids=segment_ids,
+            indicator=indicator,
+        )
 
-        x = self.input_proj(x) * output_image_mask
-
-        # Keep shape (B, 1, ...) when t is per-sample so downstream adaln_modulation
-        # projections don't pay for L identical copies.
-        t_cond = self.t_embedding(t)
-        if t.dim() == 1:
-            t_cond = t_cond.unsqueeze(1)
-        adaln_input = F.silu(self.adaln_proj(t_cond))
-
+    def _prepare_context_from_masked(
+        self,
+        *,
+        llm_features: torch.Tensor,
+        llm_token_mask: torch.Tensor,
+        output_image_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        segment_ids: torch.Tensor,
+        indicator: torch.Tensor,
+    ) -> Ideogram4TransformerContext:
         llm_features = self.llm_cond_norm(llm_features)
-        llm_features = self.llm_cond_proj(llm_features) * llm_token_mask
-
-        h = x + llm_features
+        projected_llm_features = self.llm_cond_proj(llm_features) * llm_token_mask
 
         image_indicator_embedding = self.embed_image_indicator(
             (indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long)
         )
-        h = h + image_indicator_embedding
 
         cos, sin = self.rotary_emb(position_ids)
-        cos = cos.to(h.dtype)
-        sin = sin.to(h.dtype)
+        cos = cos.to(projected_llm_features.dtype)
+        sin = sin.to(projected_llm_features.dtype)
 
         # Block-diagonal mask from segment ids: (B, 1, L, L), True = attend.
         # Only built for the native (SDPA) backend; flash expresses the same
@@ -515,20 +582,83 @@ class Ideogram4Transformer2DModel(nn.Module):
             ).unsqueeze(1)
             flash_meta = None
 
+        return Ideogram4TransformerContext(
+            projected_llm_features=projected_llm_features,
+            output_image_mask=output_image_mask,
+            image_indicator_embedding=image_indicator_embedding,
+            cos=cos,
+            sin=sin,
+            attn_mask=attn_mask,
+            flash_meta=flash_meta,
+        )
+
+    def _prepare_dynamic_inputs(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        output_image_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = x * output_image_mask
+        x = self.input_proj(x) * output_image_mask
+
+        # Keep shape (B, 1, ...) when t is per-sample so downstream adaln_modulation
+        # projections don't pay for L identical copies.
+        t_cond = self.t_embedding(t)
+        if t.dim() == 1:
+            t_cond = t_cond.unsqueeze(1)
+        adaln_input = F.silu(self.adaln_proj(t_cond))
+        return x, adaln_input
+
+    def forward_with_context(
+        self,
+        *,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        context: Ideogram4TransformerContext,
+    ) -> torch.Tensor:
+        """Run the dynamic noise/timestep path with prepared conditioning."""
+        _, _, in_channels = x.shape
+        assert in_channels == self.config.in_channels
+
+        param_dtype = self.input_proj.weight.dtype
+        x = x.to(param_dtype)
+        t = t.to(param_dtype)
+
+        x, adaln_input = self._prepare_dynamic_inputs(
+            x, t, context.output_image_mask
+        )
+        return self._forward_blocks(x, adaln_input, context)
+
+    def _forward_blocks(
+        self,
+        x: torch.Tensor,
+        adaln_input: torch.Tensor,
+        context: Ideogram4TransformerContext,
+    ) -> torch.Tensor:
+        h = x + context.projected_llm_features
+        h = h + context.image_indicator_embedding
+
         for layer in self.layers:
             if self.gradient_checkpointing and torch.is_grad_enabled():
                 h = checkpoint(
                     layer,
                     h,
-                    attn_mask,
-                    cos,
-                    sin,
+                    context.attn_mask,
+                    context.cos,
+                    context.sin,
                     adaln_input,
-                    flash_meta,
+                    context.flash_meta,
                     use_reentrant=False,
                 )
             else:
-                h = layer(h, attn_mask, cos, sin, adaln_input, flash_meta)
+                h = layer(
+                    h,
+                    context.attn_mask,
+                    context.cos,
+                    context.sin,
+                    adaln_input,
+                    context.flash_meta,
+                )
 
         out = self.final_layer(h, c=adaln_input)
         return out.to(torch.float32)

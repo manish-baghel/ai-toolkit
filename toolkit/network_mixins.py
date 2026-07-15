@@ -50,6 +50,23 @@ ExtractMode = Union[
 printed_messages = []
 
 
+def _is_fixed_unit_multiplier(multiplier) -> bool:
+    """Return whether a host-side multiplier is statically all ones.
+
+    Dataset weights arrive as Python lists during ordinary training. Checking
+    those values once when the network multiplier changes lets every LoRA
+    module avoid materializing an identity multiply. Tensor multipliers stay
+    on the existing path so this check never synchronizes CUDA.
+    """
+    if isinstance(multiplier, (int, float)):
+        return multiplier == 1.0
+    if isinstance(multiplier, (list, tuple)):
+        return bool(multiplier) and all(
+            _is_fixed_unit_multiplier(value) for value in multiplier
+        )
+    return False
+
+
 def print_once(msg):
     global printed_messages
     if msg not in printed_messages:
@@ -162,6 +179,11 @@ class ExtractableModuleMixin:
 
         # assign them
 
+        # Extraction mutates the adapter's rank/scale. Keep the optimized
+        # training path conservative for extracted adapters.
+        if hasattr(self, '_has_fixed_unit_scale'):
+            self._has_fixed_unit_scale = False
+
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
             # scaler is a parameter update the value with 1.0
@@ -216,6 +238,17 @@ class ToolkitModuleMixin:
             scale = self.scale
 
         lx = self.lora_up(lx)
+
+        # Standard LoRA uses a fixed, non-trainable scalar. When alpha equals
+        # rank, and rank dropout is not changing the effective scale, this
+        # multiplication is exactly the identity.
+        rank_dropout_active = (
+            self.rank_dropout is not None
+            and self.rank_dropout > 0
+            and self.training
+        )
+        if getattr(self, '_has_fixed_unit_scale', False) and not rank_dropout_active:
+            return lx
 
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
@@ -295,14 +328,17 @@ class ToolkitModuleMixin:
         lora_output = self._call_forward(lora_input)
         multiplier = self.network_ref().torch_multiplier
 
-        lora_output_batch_size = lora_output.size(0)
-        multiplier_batch_size = multiplier.size(0)
-        if lora_output_batch_size != multiplier_batch_size:
-            num_interleaves = lora_output_batch_size // multiplier_batch_size
-            # todo check if this is correct, do we just concat when doing cfg?
-            multiplier = multiplier.repeat_interleave(num_interleaves)
+        if getattr(network, '_multiplier_is_one', False):
+            scaled_lora_output = lora_output
+        else:
+            lora_output_batch_size = lora_output.size(0)
+            multiplier_batch_size = multiplier.size(0)
+            if lora_output_batch_size != multiplier_batch_size:
+                num_interleaves = lora_output_batch_size // multiplier_batch_size
+                # todo check if this is correct, do we just concat when doing cfg?
+                multiplier = multiplier.repeat_interleave(num_interleaves)
 
-        scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
+            scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
         scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)
 
         if self.__class__.__name__ == "DoRAModule":
@@ -481,6 +517,7 @@ class ToolkitNetworkMixin:
         self.can_merge_in = not is_lorm
         # will prevent optimizer from loading as it will have double states
         self.did_change_weights = False
+        self._multiplier_is_one = True
 
     def get_keymap(self: Network, force_weight_mapping=False):
         use_weight_mapping = False
@@ -754,6 +791,7 @@ class ToolkitNetworkMixin:
         # builds a tensor for fast usage in the forward pass of the network modules
         # without having to set it in every single module every time it changes
         multiplier = self._multiplier
+        self._multiplier_is_one = _is_fixed_unit_multiplier(multiplier)
         # get first module
         try:
             first_module = self.get_all_modules()[0]
