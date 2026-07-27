@@ -23,6 +23,12 @@ else:
 class SaveConfig:
     def __init__(self, **kwargs):
         self.save_every: int = kwargs.get('save_every', 1000)
+        # Keep the default at zero so existing configs retain the original
+        # absolute save cadence. A later start avoids serializing checkpoints
+        # that would only be deleted before the useful part of a long run.
+        self.save_start_step: int = kwargs.get('save_start_step', 0) or 0
+        if self.save_start_step < 0:
+            raise ValueError("save_start_step must be at least 0")
         self.dtype: str = kwargs.get('dtype', 'float16')
         self.max_step_saves_to_keep: int = kwargs.get('max_step_saves_to_keep', 5)
         self.save_format: SaveFormat = kwargs.get('save_format', 'safetensors')
@@ -31,6 +37,13 @@ class SaveConfig:
         self.push_to_hub: bool = kwargs.get("push_to_hub", False)
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
+
+    def should_save(self, step: int) -> bool:
+        if not self.save_every or self.save_every < 0:
+            return False
+        if step < self.save_start_step:
+            return False
+        return (step - self.save_start_step) % self.save_every == 0
 
 class LoggingConfig:
     def __init__(self, **kwargs):
