@@ -1257,19 +1257,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     timestep_indices = timestep_indices.long()
                 elif self.train_config.timestep_type == 'one_step':
                     timestep_indices = torch.zeros((batch_size,), device=self.device_torch, dtype=torch.long)
-                elif content_or_style in ['style', 'content']:
-                    # this is from diffusers training code
-                    # Cubic sampling for favoring later or earlier timesteps
-                    # For more details about why cubic sampling is used for content / structure,
-                    # refer to section 3.4 of https://arxiv.org/abs/2302.08453
-
-                    # for content / structure, it is best to favor earlier timesteps
-                    # for style, it is best to favor later timesteps
+                elif content_or_style in ['style', 'content', 'content_u2']:
+                    # Power-law index sampling. content uses U^3 (strong high-noise
+                    # bias); content_u2 uses U^2 (milder). style is the U^3 mirror
+                    # toward low noise. See section 3.4 of https://arxiv.org/abs/2302.08453
 
                     orig_timesteps = torch.rand((batch_size,), device=latents.device)
 
                     if content_or_style == 'content':
                         timestep_indices = orig_timesteps ** 3 * self.train_config.num_train_timesteps
+                    elif content_or_style == 'content_u2':
+                        timestep_indices = orig_timesteps ** 2 * self.train_config.num_train_timesteps
                     elif content_or_style == 'style':
                         timestep_indices = (1 - orig_timesteps ** 3) * self.train_config.num_train_timesteps
 

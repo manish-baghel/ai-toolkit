@@ -675,6 +675,7 @@ export default function SimpleJob({
                   options={[
                     { value: 'balanced', label: 'Balanced' },
                     { value: 'content', label: 'High Noise' },
+                    { value: 'content_u2', label: 'High-Mid Noise (U2)' },
                     { value: 'style', label: 'Low Noise' },
                   ]}
                 />
