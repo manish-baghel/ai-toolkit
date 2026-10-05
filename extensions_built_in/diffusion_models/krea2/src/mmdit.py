@@ -20,6 +20,8 @@ import math
 from dataclasses import dataclass
 
 import torch
+
+from toolkit.models.v2._mixin import OstrisModelMixin
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -56,7 +58,21 @@ def attention(
     scale: float | None = None,
     gqa: bool = False,
 ) -> Tensor:
-    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+    # cuDNN attention is NVIDIA-only, so hardcoding SDPBackend.CUDNN_ATTENTION
+    # raises "No available kernel" on non-NVIDIA backends (AMD ROCm, Intel XPU,
+    # Apple MPS). Pass a priority list instead: cuDNN is still preferred on
+    # NVIDIA, and the dispatcher falls back to flash/efficient/math elsewhere.
+    # (On ROCm gfx11xx the flash path needs
+    # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1; masked attention uses math.)
+    with sdpa_kernel(
+        [
+            SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
+        ],
+        set_priority=True,
+    ):
         x = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
         )
@@ -104,6 +120,11 @@ class SingleMMDiTConfig:
     txtlayers: int = 1
     txtheads: int = 20
     txtkvheads: int = 20
+
+    @property
+    def patch_size(self) -> int:
+        # trainer probes config.patch_size for the dynamic-shift token count
+        return self.patch
 
 
 class SimpleModulation(torch.nn.Module):
@@ -394,7 +415,15 @@ class SingleStreamBlock(nn.Module):
         return x
 
 
-class SingleStreamDiT(nn.Module):
+class SingleStreamDiT(nn.Module, OstrisModelMixin):
+    def get_offload_ignore_modules(self):
+        # modulation modules hold tiny live state the offloader must not page
+        return [
+            module
+            for module in self.modules()
+            if isinstance(module, (SimpleModulation, DoubleSharedModulation))
+        ]
+
     def __init__(self, config: SingleMMDiTConfig):
         super().__init__()
         self.config = config

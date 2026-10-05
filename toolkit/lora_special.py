@@ -69,15 +69,6 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         torch.nn.Module.__init__(self)
         self.lora_name = lora_name
         self.orig_module_ref = weakref.ref(org_module)
-        # read the device off a param/buffer directly: OstrisLinear.weight is a
-        # property that dequantizes the whole weight just to answer .device
-        org_tensor = next(
-            (t for t in org_module._parameters.values() if t is not None),
-            next((t for t in org_module._buffers.values() if t is not None), None),
-        )
-        self.scalar = torch.tensor(
-            1.0, device=org_tensor.device if org_tensor is not None else None
-        )
 
         # if is ara lora module, mark it on the layer so memory manager can handle it
         if is_ara:
@@ -120,14 +111,13 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
                 self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=use_bias)
 
         if type(alpha) == torch.Tensor:
-            alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
+            alpha = float(alpha.detach().float().item())
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
-        self.scale = alpha / self.lora_dim
-        # ``scalar`` above is a fixed tensor equal to one for standard LoRA.
-        # ToolkitModuleMixin can therefore omit the scale multiply when alpha
-        # also equals rank. LyCORIS modules do not set this flag because their
-        # scalar can be trainable.
-        self._has_fixed_unit_scale = bool(self.scale == 1.0)
+        self._set_runtime_scale(float(alpha) / self.lora_dim)
+        # Standard LoRA has no trainable scalar, so its initial unit scale can
+        # skip an identity multiply. Runtime scale updates invalidate this
+        # shortcut; LyCORIS modules never opt in because their scalar is trainable.
+        self._has_fixed_unit_scale = self.scale == 1.0
         self.register_buffer("alpha", torch.tensor(alpha))  # 定数として扱える
 
         # same as microsoft's
@@ -249,20 +239,33 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
     def merge_in(self: 'FullModule', merge_weight=1.0):
         if not self.can_merge_in:
             return
-        om = self.org_module[0]
-        if 'weight._data' in om.state_dict():
-            # quanto quantized weight, can't merge
+        # a zero diff merges to identity: skip entirely (a quantized base would
+        # otherwise still get requantized, which is not lossless)
+        if not self.diff.any() and (self.diff_b is None or not self.diff_b.any()):
             return
-        org_weight = om.weight
-        orig_dtype = org_weight.dtype
-        # dequantize torchao weights so we can fold the full precision delta in
-        merged_weight = _dequantize_if_needed(org_weight).float() + merge_weight * self.diff.float().to(org_weight.device)
+        om = self.org_module[0]
+        if getattr(om, "is_ostris_quantized", False):
+            # fp32 dequant straight from the backend; the bf16 weight property
+            # would resample the quant scales on every merge cycle
+            orig_dtype = om.ostris_orig_dtype
+            base_weight = om.ostris_quantizer.dequantize(om)
+            weight_device = base_weight.device
+        else:
+            if 'weight._data' in om.state_dict():
+                # quanto quantized weight, can't merge
+                return
+            org_weight = om.weight
+            orig_dtype = org_weight.dtype
+            base_weight = _dequantize_if_needed(org_weight).float()
+            weight_device = org_weight.device
+        # fold the full precision delta in
+        merged_weight = base_weight + merge_weight * self.diff.float().to(weight_device)
         if self.weight_is_quantized:
             # re-quantize so the model stays quantized across continuous merge/reset cycles
             from toolkit.util.quantize import get_torchao_config, requantize_module_weight
             requantize_module_weight(om, merged_weight, orig_dtype, get_torchao_config(self._get_base_qtype()))
         else:
-            om.weight.data = merged_weight.to(org_weight.device, orig_dtype)
+            om.weight.data = merged_weight.to(weight_device, orig_dtype)
         # bias is never quantized
         if self.diff_b is not None and getattr(om, 'bias', None) is not None:
             om.bias.data = (om.bias.data.float() + merge_weight * self.diff_b.float().to(om.bias.device)).to(om.bias.dtype)
@@ -774,4 +777,3 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 all_params.append({"lr": unet_lr, "params": list(self.unet_conv_out.parameters())})
 
         return all_params
-

@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
 import { getDatasetsRoot, getTrainingFolder, getDataRoot } from '@/server/settings';
+import { catchAllToFilePath } from '@/server/catchAllPath';
 
 const contentTypeMap: { [key: string]: string } = {
   // Images
@@ -29,11 +30,12 @@ const contentTypeMap: { [key: string]: string } = {
   '.ogg': 'audio/ogg',
 };
 
-export async function GET(request: NextRequest, { params }: { params: { imagePath: string } }) {
+export async function GET(request: NextRequest, { params }: { params: { imagePath: string | string[] } }) {
   const { imagePath } = await params;
   try {
-    // Decode the path
-    const filepath = decodeURIComponent(imagePath);
+    // Segments are already URL-decoded by Next.js; accepts both the legacy
+    // single-segment form and the `<folder>/<filename>` form.
+    const filepath = catchAllToFilePath(imagePath);
 
     // Get allowed directories
     const datasetRoot = await getDatasetsRoot();
@@ -45,7 +47,7 @@ export async function GET(request: NextRequest, { params }: { params: { imagePat
     // Security check: resolve the path so any `..` segments are collapsed,
     // then ensure it's still under an allowed root. (Plain `.includes('..')`
     // false-positives on filenames that contain `..` as text, e.g. an ellipsis.)
-    const resolved = path.resolve(filepath);
+    let resolved = path.resolve(filepath);
     const isAllowed = allowedDirs.some(
       allowedDir => resolved === allowedDir || resolved.startsWith(allowedDir + path.sep),
     );
@@ -53,6 +55,21 @@ export async function GET(request: NextRequest, { params }: { params: { imagePat
     if (!isAllowed) {
       console.warn(`Access denied: ${resolved} not in ${allowedDirs.join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
+    }
+
+    // ?thumb=1 serves the pre-generated 300x300 thumb from the sibling .thumbs
+    // folder when it exists; otherwise falls through to the full file exactly
+    // as before. A source with alpha gets a <name>.<ext>.png thumb so the
+    // transparency survives, everything else stays <name>.<ext>.jpg.
+    if (request.nextUrl.searchParams.has('thumb')) {
+      const thumbBase = path.join(path.dirname(resolved), '.thumbs', path.basename(resolved));
+      for (const thumbPath of [`${thumbBase}.png`, `${thumbBase}.jpg`]) {
+        const thumbStat = await fs.promises.stat(thumbPath).catch(() => null);
+        if (thumbStat && thumbStat.isFile()) {
+          resolved = thumbPath;
+          break;
+        }
+      }
     }
 
     // Bail out early if the client already gave up

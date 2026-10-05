@@ -11,6 +11,8 @@ export interface GpuMemory {
   total: number;
   free: number;
   used: number;
+  // unified memory (e.g. GB10): figures are the system RAM pool the GPU shares
+  shared?: boolean;
 }
 
 export interface GpuPower {
@@ -57,6 +59,29 @@ export interface GPUApiResponse {
 }
 
 /**
+ * System monitor stream (SSE at /api/monitor)
+ */
+
+// Rolling history only logs load + memory; everything else (temps, fans,
+// power, clocks) is instantaneous-only via MonitorSample.
+export interface MonitorHistoryPoint {
+  t: number; // epoch ms
+  cpu: { load: number; memUsedMb: number };
+  // one entry per GPU, same order as MonitorSample.gpu.gpus (sorted by index)
+  gpus: { load: number; memUsedMb: number }[];
+}
+
+export interface MonitorSample {
+  t: number;
+  cpu: CpuInfo | null;
+  gpu: GPUApiResponse;
+}
+
+export interface MonitorInit extends MonitorSample {
+  history: MonitorHistoryPoint[];
+}
+
+/**
  * Training configuration
  */
 
@@ -83,6 +108,7 @@ export interface SaveConfig {
 }
 
 export interface DatasetConfig {
+  batch_size?: number;
   folder_path: string;
   mask_path: string | null;
   mask_min_value: number;
@@ -115,6 +141,18 @@ export interface DatasetConfig {
 export interface EMAConfig {
   use_ema: boolean;
   ema_decay: number;
+}
+
+export interface ValidationItem {
+  image_path: string;
+  prompt: string;
+}
+
+export interface ValidationConfig {
+  validation_items: ValidationItem[];
+  resolution: number;
+  validate_every_n_steps: number;
+  validation_sigmas?: number[];
 }
 
 export interface TrainConfig {
@@ -151,6 +189,9 @@ export interface TrainConfig {
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;
   max_loss?: number | null;
+  validation_config?: ValidationConfig;
+  do_guidance_loss?: boolean;
+  guidance_loss_target?: number;
 }
 
 export interface QuantizeKwargsConfig {
@@ -190,6 +231,7 @@ export interface SampleItem {
   sample_steps?: number;
   fps?: number;
   num_frames?: number;
+  duration?: number;
   ctrl_img?: string | null;
   ctrl_idx?: number;
   network_multiplier?: number;
@@ -201,6 +243,7 @@ export interface SampleItem {
 export interface SampleConfig {
   sampler: string;
   sample_every: number;
+  sample_start_step: number;
   width: number;
   height: number;
   prompts?: string[];
@@ -212,6 +255,7 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  duration?: number;
 }
 
 export interface LoggingConfig {
@@ -261,6 +305,21 @@ export interface JobConfig {
   meta: MetaConfig;
 }
 
+// A LoRA published on the hub, offered for a specific model option. `path` is a
+// 'org/repo/path_to/file.safetensors' reference; the backend looks for it under
+// the models folder first and downloads it into MODELS_PATH/loras if missing.
+export interface CloudLora {
+  path: string;
+  name: string;
+  description?: string;
+}
+
+export interface CaptionLora {
+  path: string;
+  name: string;
+  strength: number;
+}
+
 export interface CaptionProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -280,7 +339,15 @@ export interface CaptionProcessConfig {
     max_res?: number;
     max_new_tokens?: number;
     fixed_caption?: string;
+    caption_format?: string;
+    extract_vocals_before_transcribe?: boolean;
+    keep_timestamps?: boolean;
     caption_extension?: string;
+    thinking?: boolean;
+    batch_size?: number;
+    layer_offloading?: boolean;
+    layer_offloading_percent?: number;
+    loras?: CaptionLora[];
   }
 }
 
