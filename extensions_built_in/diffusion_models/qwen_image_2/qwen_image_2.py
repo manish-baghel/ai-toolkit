@@ -126,6 +126,10 @@ class QwenImage2Model(BaseModel):
         self.target_lora_modules = ["QwenImage21Transformer2DModel"]
         self.vae_scale_factor = VAE_SCALE_FACTOR
         self.prompt_encoder: Optional[QwenImage21PromptEncoder] = None
+        self.use_prepared_training_cache = bool(
+            self.model_config.model_kwargs.get("cache_prepared_training_inputs", False)
+        )
+        self._prepared_training_cache = None
 
         # Editing is not a separate model here, it is what happens when the
         # dataset has a control path: reference images ride into the text
@@ -221,7 +225,11 @@ class QwenImage2Model(BaseModel):
     def encode_images(self, image_list, device=None, dtype=None):
         device = device or self.vae_device_torch
         dtype = dtype or self.vae_torch_dtype
+        posterior = self._encode_image_distribution(image_list, device, dtype)
+        return self._sample_image_distribution(posterior, device, dtype)
 
+    def _encode_image_distribution(self, image_list, device, dtype):
+        """Encode without consuming RNG, so reference posteriors can be reused."""
         if self.vae.device == torch.device("cpu"):
             self.vae.to(device)
         self.vae.eval()
@@ -234,7 +242,12 @@ class QwenImage2Model(BaseModel):
             images = torch.cat([images, torch.ones_like(images[:, :1])], dim=1)
         images = images.unsqueeze(2)  # single-frame dim
 
-        latents = self.vae.encode(images).latent_dist.sample()
+        return self.vae.encode(images).latent_dist
+
+    def _sample_image_distribution(self, posterior, device, dtype):
+        # Keep the ordinary sample -> normalize -> cast ordering. The prepared
+        # path reuses the distribution, never a fixed sampled reference latent.
+        latents = posterior.sample()
         mean, std = self._latent_stats(latents.device, latents.dtype)
         latents = (latents - mean) / std
         return latents.squeeze(2).to(device, dtype=dtype)
@@ -450,6 +463,28 @@ class QwenImage2Model(BaseModel):
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
+    def prepare_training_cache(self, **kwargs):
+        if not self.use_prepared_training_cache:
+            return
+        from .src.training_cache import QwenPreparedTrainingCache
+
+        if self._prepared_training_cache is not None:
+            self._prepared_training_cache.clear()
+        self._prepared_training_cache = QwenPreparedTrainingCache(self, **kwargs)
+
+    def get_prepared_training_inputs(self, file_items):
+        if not self.use_prepared_training_cache:
+            return None
+        if self._prepared_training_cache is None:
+            raise RuntimeError("Qwen prepared training cache has not been initialized")
+        return self._prepared_training_cache.get_inputs(file_items)
+
+    def clear_prepared_training_cache(self):
+        if self._prepared_training_cache is not None:
+            self._prepared_training_cache.clear()
+            self._prepared_training_cache = None
+        self.use_prepared_training_cache = False
+
     def condition_noisy_latents(
         self, latents: torch.Tensor, batch: "DataLoaderBatchDTO"
     ):
@@ -462,19 +497,41 @@ class QwenImage2Model(BaseModel):
         timestep: torch.Tensor,  # 0..1000 scale
         text_embeddings: AdvancedPromptEmbeds,
         batch: "DataLoaderBatchDTO" = None,
+        is_primary_pred: bool = False,
         **kwargs,
     ):
         if self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
         batch_size = latent_model_input.shape[0]
 
-        prompt_embeds, prompt_mask, slot_mask = self.pad_prompt_embeds(text_embeddings)
+        batch_context = getattr(batch, "prepared_training_context", None)
+        run_context = batch_context.run_context if is_primary_pred and batch_context is not None else None
+        if run_context is None:
+            prompt_embeds, prompt_mask, slot_mask = self.pad_prompt_embeds(text_embeddings)
+        else:
+            prompt_embeds = run_context.prompt_embeds
+            prompt_mask = run_context.prompt_mask
+            slot_mask = run_context.image_slot_mask
 
         # The prompt is what decides: it reserved the slots the references go
         # into, so a prompt encoded without them (a plain T2I dataset, a fully
         # dropped caption) takes no references here either.
         condition_latents, condition_shapes = None, []
-        if batch is not None and bool(slot_mask.any()):
+        has_references = (
+            bool(batch_context.reference_posteriors)
+            if run_context is not None
+            else batch is not None and bool(slot_mask.any())
+        )
+        if has_references and batch_context is not None:
+            with torch.no_grad():
+                condition_latents = torch.cat([
+                    pack_latents(self._sample_image_distribution(
+                        posterior, self.device_torch, self.torch_dtype,
+                    ))
+                    for posterior in batch_context.reference_posteriors
+                ], dim=1)
+                condition_shapes = batch_context.reference_shapes
+        elif has_references:
             with torch.no_grad():
                 control = batch.control_tensor_list
                 if control is None:
@@ -509,6 +566,7 @@ class QwenImage2Model(BaseModel):
             slot_mask,
             condition_latents=condition_latents,
             condition_shapes=condition_shapes,
+            prepared_context=run_context,
             **kwargs,
         )
 

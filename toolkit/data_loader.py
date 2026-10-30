@@ -638,6 +638,13 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         prepared_cache_key = getattr(
             source_file_item, "_ideogram4_prepared_cache_key", None
         )
+        if prepared_cache_key is None:
+            prepared_cache_key = getattr(
+                source_file_item, "_qwen_image_2_prepared_cache_key", None
+            )
+        krea_cache_key = getattr(source_file_item, "_krea2_prepared_cache_key", None)
+        if prepared_cache_key is None:
+            prepared_cache_key = krea_cache_key
         if prepared_cache_key is not None:
             # Keep all mutable metadata isolated, but do not clone the large CPU
             # latent that the model-owned GPU cache replaces for this path.
@@ -652,6 +659,17 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             file_item = copy.deepcopy(source_file_item, memo)
             file_item._encoded_latent = None
             file_item._cached_first_frame_latent = None
+            if krea_cache_key is not None and file_item.has_control_image:
+                try:
+                    # Krea edits still load reference images per draw; their
+                    # fresh VAE sampling remains in the model's ordinary path.
+                    file_item.load_control_image()
+                except Exception as e:
+                    print(f"Error loading image, skipping and loading a different one: {file_item.path} ({e})")
+                    if _attempts >= 10:
+                        raise
+                    new_index = self._get_replacement_index(index)
+                    return self._get_single_item(new_index, _attempts=_attempts + 1)
             file_item.load_caption(self.caption_dict)
             return file_item
 

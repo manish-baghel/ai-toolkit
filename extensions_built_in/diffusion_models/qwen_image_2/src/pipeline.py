@@ -18,6 +18,7 @@ the sequence.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
@@ -239,6 +240,106 @@ def unpack_latents(latents: torch.Tensor, height: int, width: int) -> torch.Tens
     return latents.transpose(1, 2).reshape(batch_size, channels, height, width)
 
 
+@dataclass(frozen=True)
+class _QwenImage21RunContext:
+    prompt_embeds: torch.Tensor
+    prompt_mask: torch.Tensor
+    image_slot_mask: torch.Tensor
+    prompt_versions: tuple[int, int, int]
+    target_shape: tuple[int, int]
+    condition_shapes: tuple[tuple[int, int], ...]
+    img_shapes: tuple[tuple[tuple[int, int, int], ...], ...]
+    img_mask: torch.Tensor
+    encoder_mask: Optional[torch.Tensor]
+    transformer_context: object
+
+
+def _prepare_run_layout(
+    batch_size: int,
+    prompt_mask: torch.Tensor,
+    image_slot_mask: torch.Tensor,
+    target_shape: tuple[int, int],
+    condition_shapes: Sequence[tuple[int, int]],
+):
+    # Checking slot counts/all-valid masks synchronizes CUDA. Do it only once
+    # for prepared runs, and retain the same validation on ordinary calls.
+    expected_slots = sum(h * w for h, w in condition_shapes) // LATENT_TOKENS_PER_SLOT
+    actual_slots = int(image_slot_mask[0].sum())
+    if actual_slots != expected_slots:
+        raise ValueError(
+            f"the prompt embeddings hold {actual_slots} reference "
+            f"image slots but {len(condition_shapes)} reference image(s) were passed, "
+            f"worth {expected_slots} slots. They must be encoded together -- an "
+            "embedding cached against other references (caption dropout, a blank "
+            "unconditional embedding) cannot be reused here."
+        )
+    height, width = target_shape
+    img_shapes = [
+        [*[(1, h, w) for h, w in condition_shapes], (1, height, width)]
+    ] * batch_size
+    img_mask = torch.cat(
+        [
+            image_slot_mask,
+            image_slot_mask.new_ones(
+                batch_size, height * width // LATENT_TOKENS_PER_SLOT
+            ),
+        ],
+        dim=1,
+    )
+    encoder_mask = None if bool(prompt_mask.all()) else prompt_mask
+    return img_shapes, img_mask, encoder_mask
+
+
+def prepare_run_context(
+    transformer,
+    prompt_embeds: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    image_slot_mask: torch.Tensor,
+    *,
+    target_shape: tuple[int, int],
+    condition_shapes: Sequence[tuple[int, int]] = (),
+) -> _QwenImage21RunContext:
+    """Prepare a fixed B=1 training prompt/layout with frozen ``txt_in``.
+
+    Reuse these exact prompt tensors without modifying them. Reference latent
+    values and target latents remain fresh inputs; no block activations or KV
+    states are retained across optimizer updates.
+    """
+    if (
+        prompt_embeds.shape[0] != 1
+        or prompt_mask.shape != prompt_embeds.shape[:2]
+        or image_slot_mask.shape != prompt_mask.shape
+        or prompt_mask.device != prompt_embeds.device
+        or image_slot_mask.device != prompt_embeds.device
+    ):
+        raise ValueError(
+            "Prepared contexts require matching B=1 prompt tensors on one device."
+        )
+    target_shape = tuple(target_shape)
+    condition_shapes = tuple(tuple(shape) for shape in condition_shapes)
+    img_shapes, img_mask, encoder_mask = _prepare_run_layout(
+        1, prompt_mask, image_slot_mask, target_shape, condition_shapes
+    )
+    context = transformer.prepare_context(
+        encoder_hidden_states=prompt_embeds,
+        encoder_hidden_states_mask=encoder_mask,
+        img_shapes=img_shapes,
+        img_mask=img_mask,
+    )
+    return _QwenImage21RunContext(
+        prompt_embeds,
+        prompt_mask,
+        image_slot_mask,
+        (prompt_embeds._version, prompt_mask._version, image_slot_mask._version),
+        target_shape,
+        condition_shapes,
+        tuple(tuple(sample) for sample in img_shapes),
+        img_mask,
+        encoder_mask,
+        context,
+    )
+
+
 def run_transformer(
     transformer,
     latents: torch.Tensor,  # (B, C, h, w) noisy target latents
@@ -248,6 +349,7 @@ def run_transformer(
     image_slot_mask: torch.Tensor,  # (B, L) bool
     condition_latents: Optional[torch.Tensor] = None,  # (B, N, C) packed, in slot order
     condition_shapes: Sequence[tuple[int, int]] = (),  # per condition image (h, w)
+    prepared_context: Optional[_QwenImage21RunContext] = None,
     **kwargs,
 ) -> torch.Tensor:
     """Run the DiT on the joint sequence and return the target velocity as
@@ -259,36 +361,42 @@ def run_transformer(
     if condition_latents is not None:
         hidden_states = torch.cat([condition_latents, hidden_states], dim=1)
 
-    # The prompt reserved one slot per 2x2 group of each reference's latent
-    # tokens. Embeddings encoded against different references than the ones
-    # passed here (a shared blank/unconditional embedding, say) would silently
-    # mis-slot the sequence, so check it before the DiT does.
-    expected_slots = sum(h * w for h, w in condition_shapes) // LATENT_TOKENS_PER_SLOT
-    if int(image_slot_mask[0].sum()) != expected_slots:
-        raise ValueError(
-            f"the prompt embeddings hold {int(image_slot_mask[0].sum())} reference "
-            f"image slots but {len(condition_shapes)} reference image(s) were passed, "
-            f"worth {expected_slots} slots. They must be encoded together -- an "
-            "embedding cached against other references (caption dropout, a blank "
-            "unconditional embedding) cannot be reused here."
+    transformer_context = None
+    if prepared_context is None:
+        img_shapes, img_mask, encoder_mask = _prepare_run_layout(
+            batch_size, prompt_mask, image_slot_mask, (height, width), condition_shapes
         )
-
-    img_shapes = [
-        [*[(1, h, w) for h, w in condition_shapes], (1, height, width)]
-    ] * batch_size
-
-    # one image slot per 2x2 group of target latent tokens
-    img_mask = torch.cat(
-        [
-            image_slot_mask,
-            image_slot_mask.new_ones(
-                batch_size, target_tokens // LATENT_TOKENS_PER_SLOT
-            ),
-        ],
-        dim=1,
-    )
-    # a mask with nothing masked costs the attention backends that reject one
-    encoder_mask = None if bool(prompt_mask.all()) else prompt_mask
+    else:
+        context = prepared_context
+        reference_tokens = sum(h * w for h, w in context.condition_shapes)
+        if (
+            batch_size != 1
+            or (height, width) != context.target_shape
+            or tuple(tuple(shape) for shape in condition_shapes)
+            != context.condition_shapes
+            or prompt_embeds is not context.prompt_embeds
+            or prompt_mask is not context.prompt_mask
+            or image_slot_mask is not context.image_slot_mask
+            or (prompt_embeds._version, prompt_mask._version, image_slot_mask._version)
+            != context.prompt_versions
+            or latents.device != prompt_embeds.device
+            or latents.dtype != prompt_embeds.dtype
+            or (condition_latents is None and reference_tokens != 0)
+            or (
+                condition_latents is not None
+                and (
+                    condition_latents.shape != (batch_size, reference_tokens, channels)
+                    or condition_latents.device != latents.device
+                    or condition_latents.dtype != latents.dtype
+                )
+            )
+        ):
+            raise ValueError(
+                "Prepared context does not match these prompt/target/reference inputs."
+            )
+        img_shapes = context.img_shapes
+        img_mask, encoder_mask = context.img_mask, context.encoder_mask
+        transformer_context = context.transformer_context
 
     output = transformer(
         hidden_states=hidden_states,
@@ -298,6 +406,8 @@ def run_transformer(
         img_shapes=img_shapes,
         img_mask=img_mask,
         return_dict=False,
+        prepared_context=transformer_context,
+        target_only=True,
         **kwargs,
     )[0]
     return unpack_latents(output[:, -target_tokens:], height, width)

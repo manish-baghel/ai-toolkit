@@ -283,6 +283,105 @@ class LastLayer(torch.nn.Module):
         return x
 
 
+def _is_unpatched_module(module: nn.Module, expected_type: type) -> bool:
+    return (
+        type(module) is expected_type
+        and "forward" not in module.__dict__
+        and not any(
+            getattr(module, name, None)
+            or getattr(nn.modules.module, "_global" + name, None)
+            for name in (
+                "_forward_pre_hooks", "_forward_hooks",
+                "_backward_pre_hooks", "_backward_hooks",
+            )
+        )
+    )
+
+
+def _can_slice_last_layer(layer: nn.Module) -> bool:
+    """Only the stock, tokenwise head may skip unused output rows.
+
+    LoRA replaces a Linear's ``forward`` with an external module's method, so
+    inspecting this module tree for Dropout alone would miss adapter dropout.
+    Wrappers and hooks conservatively keep the full-head path and its RNG order.
+    """
+    if type(layer) is not LastLayer:
+        return False
+    for module, expected_type in (
+        (layer, LastLayer),
+        (layer.norm, RMSNorm),
+        (layer.linear, nn.Linear),
+        (layer.modulation, SimpleModulation),
+    ):
+        if not _is_unpatched_module(module, expected_type):
+            return False
+    return True
+
+
+def _geometry_model_signature(model) -> tuple:
+    if not _is_unpatched_module(model.posemb, PositionalEncoding):
+        raise ValueError("Prepared Krea geometry requires the stock positional encoding")
+    return (
+        id(model), id(model.posemb), model.config.patch, model.config.channels,
+        model.config.txtlayers, model.config.txtdim, tuple(model.posemb.axdims),
+        model.posemb.theta, model.posemb.ntk, model.posemb.forward.__func__,
+    )
+
+
+@dataclass(frozen=True)
+class _PreparedVelocityContext:
+    """One item's fixed raw text and geometry; never learned activations.
+
+    Created by ``pipeline.prepare_velocity_context``. Text fusion remains live
+    even for transformer-only LoRA: its layerwise/refiner *blocks* are adapted.
+    """
+
+    features: Tensor
+    text_mask: Tensor
+    stacked_context: Tensor
+    pos: Tensor
+    mask: Tensor
+    text_attention_mask: Tensor
+    attention_mask: Tensor
+    freqs: Tensor
+    padlen: int
+    latent_spec: tuple
+    model_signature: tuple
+    source_versions: tuple
+    isolate_refs: bool
+
+    def validate_inputs(self, latents, features, text_mask):
+        if features is not self.features or text_mask is not self.text_mask:
+            raise ValueError("Prepared Krea context requires its original text tensors")
+        if (tuple(latents.shape), latents.device, latents.dtype) != self.latent_spec:
+            raise ValueError("Prepared Krea context latent shape/device/dtype changed")
+
+    def validate_forward(
+        self, model, img, context, pos, mask, reflen, isolate_refs,
+        ref_kv_capture, ref_kv_cache,
+    ):
+        if reflen or ref_kv_capture is not None or ref_kv_cache is not None:
+            raise ValueError("Prepared Krea geometry does not support references or K/V caches")
+        if isolate_refs != self.isolate_refs:
+            raise ValueError("Prepared Krea context isolate_refs setting changed")
+        if _geometry_model_signature(model) != self.model_signature:
+            raise ValueError("Prepared Krea context model/position configuration changed")
+        if (self.features._version, self.text_mask._version) != self.source_versions:
+            raise ValueError("Prepared Krea context source tensors were modified")
+        if self.features.requires_grad or self.text_mask.requires_grad:
+            raise ValueError("Prepared Krea context requires fixed, detached text inputs")
+        if context is not self.stacked_context or pos is not self.pos or mask is not self.mask:
+            raise ValueError("Prepared Krea context requires its original text and geometry")
+        shape, device, dtype = self.latent_spec
+        b, c, h, w = shape
+        patch = model.config.patch
+        if (
+            tuple(img.shape) != (b, (h // patch) * (w // patch), c * patch * patch)
+            or img.device != device or img.dtype != dtype
+        ):
+            raise ValueError("Prepared Krea context image tokens changed shape/device/dtype")
+
+
 class TextFusionBlock(torch.nn.Module):
     def __init__(
         self,
@@ -507,12 +606,21 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
         isolate_refs: bool = False,
         ref_kv_capture: list | None = None,
         ref_kv_cache: tuple[list, Tensor] | None = None,
+        prepared_context: _PreparedVelocityContext | None = None,
     ) -> Tensor:
+        if prepared_context is not None:
+            prepared_context.validate_forward(
+                self, img, context, pos, mask, reflen, isolate_refs,
+                ref_kv_capture, ref_kv_cache,
+            )
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
         tvec = self.tproj(t)
 
-        txtmask = _mask(mask[:, : context.shape[1]])
+        txtmask = (
+            _mask(mask[:, : context.shape[1]])
+            if prepared_context is None else prepared_context.text_attention_mask
+        )
 
         context = self.txtfusion(context, mask=txtmask)
         context = self.txtmlp(context)
@@ -522,11 +630,12 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
 
         # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
         fulllen = combined.shape[1]
-        _padlen = (-fulllen) % 256
+        _padlen = (-fulllen) % 256 if prepared_context is None else prepared_context.padlen
         if _padlen > 0:
             combined = F.pad(combined, (0, 0, 0, _padlen))
-            mask = F.pad(mask, (0, _padlen), value=False)
-            pos = F.pad(pos, (0, 0, 0, _padlen))
+            if prepared_context is None:
+                mask = F.pad(mask, (0, _padlen), value=False)
+                pos = F.pad(pos, (0, 0, 0, _padlen))
 
         blockvec = tvec
         if reflen > 0:
@@ -546,7 +655,9 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             blockvec = (tvec, self.tproj(t0), txtlen + imglen - reflen)
 
         padmask = mask  # (B, L) key-padding mask, incl. the 256-alignment pad
-        mask = _mask(mask)
+        mask = (
+            _mask(mask) if prepared_context is None else prepared_context.attention_mask
+        )
 
         if reflen > 0 and isolate_refs:
             # Asymmetric attention (OminiControl2-style "feature reuse"): ref
@@ -582,7 +693,7 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
             extra = padmask.unsqueeze(1).unsqueeze(3) & refmask.unsqueeze(1).unsqueeze(2)
             mask = torch.cat((mask, extra), dim=3)
 
-        freqs = self.posemb(pos)
+        freqs = self.posemb(pos) if prepared_context is None else prepared_context.freqs
 
         for block, blockkv in zip(self.blocks, blockcaches):
             if self.gradient_checkpointing and torch.is_grad_enabled():
@@ -605,7 +716,13 @@ class SingleStreamDiT(nn.Module, OstrisModelMixin):
                     kv_cache=blockkv,
                 )
 
-        final = self.last(combined, t)
-        output = final[:, txtlen : txtlen + imglen - reflen, :]
+        target_end = txtlen + imglen - reflen
+        if _can_slice_last_layer(self.last):
+            # All tokens still traverse every block. Only the deterministic,
+            # tokenwise output head skips rows that would be discarded anyway.
+            output = self.last(combined[:, txtlen:target_end, :], t)
+        else:
+            final = self.last(combined, t)
+            output = final[:, txtlen:target_end, :]
 
         return output

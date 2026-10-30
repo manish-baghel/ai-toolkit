@@ -11,6 +11,28 @@ Krea 2 is a single-stream MMDiT text-to-image model:
 
 Flow-matching convention matches ai-toolkit exactly (t=1 noise -> t=0 clean,
 target = noise - clean), so ``get_noise_prediction`` does no time flip / negation.
+
+Small-dataset training optimization (off by default):
+  model.model_kwargs.cache_prepared_training_inputs: true
+  train: batch_size=1, gradient_accumulation=1, gradient_accumulation_steps=1,
+         train_text_encoder=false, cache_text_embeddings=true
+  datasets: cache_latents=true, caption_dropout_rate=0, token_dropout_rate=0
+  network: transformer_only=true, type=lora (or lokr)
+  model: compile=false, layer_offloading=false, low_vram=false
+
+This retains cached target samples, raw text features, and (T2I only) static
+position/mask/RoPE data on the GPU. Text fusion stays live: its blocks receive
+LoRA updates too. Edit references retain per-prediction VAE sampling and the
+existing kv_cache attention setting. Unsupported augmentation, auxiliary-input,
+and alternate-conditioning modes fail explicitly; use the ordinary path for
+those. VRAM scales with dataset size, including a quadratic mask per T2I item.
+The cache stays resident during previews/validation; allow extra VRAM headroom.
+
+The stock tokenwise output head skips discarded text/reference/padding rows;
+patched, wrapped, or hooked heads keep the full path, including its RNG order.
+No timestep, loss, adapter coverage, precision, or attention backend is changed.
+Focused parity checks live in testing/test_krea2_prepared.py; runtime/GPU
+equivalence and speed still need measuring in an installed training environment.
 """
 
 import math
@@ -196,6 +218,10 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         # trained with kv_cache enabled for kv-cached inference (the ComfyUI
         # node / hub pipeline kv_cache toggles) to work properly.
         self.kv_cache = bool(self.model_config.model_kwargs.get("kv_cache", False))
+        self.use_prepared_training_cache = bool(
+            self.model_config.model_kwargs.get("cache_prepared_training_inputs", False)
+        )
+        self._prepared_training_cache = None
 
     @staticmethod
     def get_train_scheduler():
@@ -555,12 +581,35 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
     # ------------------------------------------------------------------
     # Training hooks
     # ------------------------------------------------------------------
+    def prepare_training_cache(self, **kwargs):
+        if not self.use_prepared_training_cache:
+            return
+        from .src.training_cache import KreaPreparedTrainingCache
+
+        if self._prepared_training_cache is not None:
+            self._prepared_training_cache.clear()
+        self._prepared_training_cache = KreaPreparedTrainingCache(self, **kwargs)
+
+    def get_prepared_training_inputs(self, file_items):
+        if not self.use_prepared_training_cache:
+            return None
+        if self._prepared_training_cache is None:
+            raise RuntimeError("Krea training cache has not been prepared")
+        return self._prepared_training_cache.get_inputs(file_items)
+
+    def clear_prepared_training_cache(self):
+        if self._prepared_training_cache is not None:
+            self._prepared_training_cache.clear()
+            self._prepared_training_cache = None
+        self.use_prepared_training_cache = False
+
     def get_noise_prediction(
         self,
         latent_model_input: torch.Tensor,  # (B, 16, h, w)
         timestep: torch.Tensor,  # 0..1000 scale
         text_embeddings: AdvancedPromptEmbeds,
         batch: "DataLoaderBatchDTO" = None,
+        is_primary_pred: bool = False,
         **kwargs,
     ):
         if self.model.device == torch.device("cpu"):
@@ -587,9 +636,14 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         if t.shape[0] != latent_model_input.shape[0]:
             t = t.expand(latent_model_input.shape[0])
 
-        context, text_mask = pad_text_features(
-            text_embeddings.text_embeds, self.device_torch, self.torch_dtype
-        )
+        batch_context = getattr(batch, "prepared_training_context", None)
+        prepared = batch_context if is_primary_pred else None
+        if prepared is None:
+            context, text_mask = pad_text_features(
+                text_embeddings.text_embeds, self.device_torch, self.torch_dtype
+            )
+        else:
+            context, text_mask = prepared.features, prepared.text_mask
 
         pred = predict_velocity(
             self.transformer,
@@ -599,6 +653,7 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             text_mask,
             ref_latents=ref_latents,
             isolate_refs=self.kv_cache,
+            prepared_context=prepared.velocity_context if prepared is not None else None,
         )
         return pred
 
@@ -729,4 +784,3 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         return ["blocks"]
 
     lora_keys_use_comfy_prefix = True
-

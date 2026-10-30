@@ -28,7 +28,8 @@ upstream:
 """
 
 import math
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -68,6 +69,45 @@ try:
 except ImportError:
     BlockMask = None
     flex_attention_module = None
+
+
+@dataclass(frozen=True)
+class QwenImage21PreparedContext:
+    """Fixed text/layout only; no block activations or learned image projections.
+
+    Only true text projections are retained, not discarded image slots or
+    target-sized zeros. Each forward allocates its own joint sequence.
+    """
+
+    transformer_id: int
+    prompt_shape: tuple[int, ...]
+    prompt_dtype: torch.dtype
+    img_shapes: tuple[tuple[tuple[int, int, int], ...], ...]
+    processor_types: tuple[type, ...]
+    source_tensors: tuple[torch.Tensor | None, ...]
+    source_versions: tuple[int | None, ...]
+    text_projection_signature: tuple[tuple[int, int, torch.device, torch.dtype], ...]
+    projected_text: torch.Tensor
+    image_positions: torch.Tensor
+    text_positions: torch.Tensor
+    target_token_mask: torch.Tensor
+    rotary_emb: torch.Tensor
+    target_tokens: int
+    prefix_len: int
+    joint_key_valid: torch.Tensor | None
+    attention_mask: Any
+    segments: tuple[tuple[int, int, bool], ...] | None
+    segment_masks: tuple[torch.Tensor | None, ...] | None
+
+
+def _has_patched_or_stochastic_forward(module: nn.Module) -> bool:
+    # Toolkit adapters replace a leaf's forward with an external LoRA/LoKr
+    # module, whose parameters are NOT registered under the original leaf.
+    return any(
+        getattr(child.forward, "__self__", None) is not child
+        or (isinstance(child, nn.Dropout) and child.training and child.p > 0)
+        for child in module.modules()
+    )
 
 
 class QwenImage21KVLayerCache:
@@ -377,6 +417,34 @@ def _qwenimage21_prefix_segments(
     return segments
 
 
+def _qwenimage21_segment_masks(
+    segments: Sequence[tuple[int, int, bool]],
+    key_valid: torch.Tensor | None,
+    device: torch.device,
+) -> list[torch.Tensor | None]:
+    """Build shared SDPA masks once, outside the blocks/checkpoint recomputes."""
+    masks = []
+    for start, end, is_text in segments:
+        mask = None
+        if is_text:
+            seg_len = end - start
+            mask = torch.cat(
+                [
+                    torch.ones(seg_len, start, dtype=torch.bool, device=device),
+                    torch.tril(
+                        torch.ones(seg_len, seg_len, dtype=torch.bool, device=device)
+                    ),
+                ],
+                dim=1,
+            )[None, None]
+        if key_valid is not None:
+            valid = key_valid[:, None, None, :end]
+            mask = valid if mask is None else mask & valid
+        masks.append(mask)
+    masks.append(None if key_valid is None else key_valid[:, None, None, :])
+    return masks
+
+
 def _qwenimage21_prepare_qkv(
     attn: "QwenImage21Attention",
     hidden_states: torch.Tensor,
@@ -451,8 +519,9 @@ class QwenImage21FlexAttnProcessor:
         layer_cache: QwenImage21KVLayerCache | None = None,
         kv_cache_mode: str | None = None,
         cache_write_slice: slice | None = None,
-        segments: list[tuple[int, int, bool]] | None = None,
+        segments: Sequence[tuple[int, int, bool]] | None = None,
         key_valid: torch.Tensor | None = None,
+        segment_masks: Sequence[torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         query, key, value, seq_len_q = _qwenimage21_prepare_qkv(
             attn,
@@ -546,8 +615,9 @@ class QwenImage21AttnProcessor:
         layer_cache: QwenImage21KVLayerCache | None = None,
         kv_cache_mode: str | None = None,
         cache_write_slice: slice | None = None,
-        segments: list[tuple[int, int, bool]] | None = None,
+        segments: Sequence[tuple[int, int, bool]] | None = None,
         key_valid: torch.Tensor | None = None,
+        segment_masks: Sequence[torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         query, key, value, seq_len_q = _qwenimage21_prepare_qkv(
             attn,
@@ -574,34 +644,14 @@ class QwenImage21AttnProcessor:
             # segments additionally get a causal triangle over their own keys; padded text keys are dropped.
             # `attention_mask` may hold the flex `BlockMask` of the same structure, which is not used here.
             prefix_len = segments[-1][1] if segments else 0
+            if segment_masks is None:
+                # Retain the standalone processor API; the model always passes
+                # precomputed masks shared by all blocks and their recomputes.
+                segment_masks = _qwenimage21_segment_masks(
+                    segments, key_valid, query.device
+                )
             outputs = []
-            for start, end, is_text in segments:
-                seg_mask = None
-                if is_text:
-                    seg_len = end - start
-                    seg_mask = torch.cat(
-                        [
-                            torch.ones(
-                                seg_len, start, dtype=torch.bool, device=query.device
-                            ),
-                            torch.tril(
-                                torch.ones(
-                                    seg_len,
-                                    seg_len,
-                                    dtype=torch.bool,
-                                    device=query.device,
-                                )
-                            ),
-                        ],
-                        dim=1,
-                    )[None, None]
-                if key_valid is not None:
-                    seg_key_valid = key_valid[:, None, None, :end]
-                    seg_mask = (
-                        seg_key_valid
-                        if seg_mask is None
-                        else (seg_mask & seg_key_valid)
-                    )
+            for (start, end, _), seg_mask in zip(segments, segment_masks):
                 outputs.append(
                     dispatch_attention_fn(
                         query[:, start:end],
@@ -618,9 +668,7 @@ class QwenImage21AttnProcessor:
                     query[:, prefix_len:],
                     key,
                     value,
-                    attn_mask=None
-                    if key_valid is None
-                    else key_valid[:, None, None, :],
+                    attn_mask=segment_masks[-1],
                     dropout_p=0.0,
                     backend=None,
                     parallel_config=self._parallel_config,
@@ -723,8 +771,9 @@ class QwenImage21TransformerBlock(nn.Module):
         layer_cache: QwenImage21KVLayerCache | None = None,
         kv_cache_mode: str | None = None,
         cache_write_slice: slice | None = None,
-        segments: list[tuple[int, int, bool]] | None = None,
+        segments: Sequence[tuple[int, int, bool]] | None = None,
         key_valid: torch.Tensor | None = None,
+        segment_masks: Sequence[torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         mod1, mod2 = modulation.chunk(2, dim=-1)
 
@@ -740,6 +789,7 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_write_slice=cache_write_slice,
             segments=segments,
             key_valid=key_valid,
+            segment_masks=segment_masks,
         )
         hidden_states = hidden_states + img_gate1.tanh() * attn_output
 
@@ -1065,6 +1115,141 @@ class QwenImage21Transformer2DModel(
         target_token_mask[image_positions[-block_lengths[-1] :]] = True
         return image_ids, target_token_mask
 
+    def is_text_projection_frozen(self) -> bool:
+        return not any(p.requires_grad for p in self.txt_in.parameters()) and not (
+            _has_patched_or_stochastic_forward(self.txt_in)
+        )
+
+    def _text_projection_signature(self):
+        return tuple(
+            (id(p), p._version, p.device, p.dtype) for p in self.txt_in.parameters()
+        )
+
+    def _build_context(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        img_shapes: list[list[tuple[int, int, int]]],
+        img_mask: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None,
+        *,
+        build_attention: bool = True,
+        cache_frozen_text: bool = False,
+    ) -> QwenImage21PreparedContext:
+        batch_size, prompt_len, _ = encoder_hidden_states.shape
+        prompt_shape = tuple(encoder_hidden_states.shape)
+        prompt_dtype = encoder_hidden_states.dtype
+        source_tensors = (
+            (encoder_hidden_states, img_mask, encoder_hidden_states_mask)
+            if cache_frozen_text else ()
+        )
+        source_versions = tuple(
+            None if tensor is None else tensor._version for tensor in source_tensors
+        )
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+        device = encoder_hidden_states.device
+
+        # Layout is shared across the batch. Keep only true text projections;
+        # every image position is supplied freshly on each forward.
+        repeats = torch.where(img_mask, _IMG_TOKENS_PER_SLOT, 1)[0]
+        image_pad_mask = torch.repeat_interleave(img_mask[0], repeats)
+        image_positions = image_pad_mask.nonzero(as_tuple=True)[0]
+        text_positions = (~image_pad_mask).nonzero(as_tuple=True)[0]
+        projected_text = encoder_hidden_states[:, ~img_mask[0][:prompt_len]]
+        target_tokens = math.prod(img_shapes[0][-1])
+        prefix_len = image_pad_mask.shape[0] - target_tokens
+        if img_mask.shape[1] != prompt_len + target_tokens // _IMG_TOKENS_PER_SLOT:
+            raise ValueError(
+                "img_mask must append exactly the target image's slots to the prompt layout."
+            )
+        rotary_emb = self.pos_embed(img_shapes[0], image_pad_mask, device=device)
+        image_ids, target_token_mask = self.build_token_metadata(
+            image_pad_mask, img_shapes[0]
+        )
+
+        # Padded text keys are excluded even when image slots interrupt text.
+        joint_key_valid = None
+        if encoder_hidden_states_mask is not None:
+            joint_key_valid = torch.ones(
+                batch_size, image_pad_mask.shape[0], dtype=torch.bool, device=device
+            )
+            vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
+            joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[
+                :, vlm_text_positions
+            ]
+
+        processor_types = tuple(
+            type(block.attn.processor) for block in self.transformer_blocks
+        )
+        attention_mask, segments, segment_masks = None, None, None
+        if build_attention:
+            if any(
+                issubclass(cls, QwenImage21FlexAttnProcessor) for cls in processor_types
+            ):
+                attention_mask = build_qwenimage21_block_causal_mask(
+                    image_ids, joint_key_valid, batch_size, device
+                )
+            if not all(
+                issubclass(cls, QwenImage21FlexAttnProcessor) for cls in processor_types
+            ):
+                segments = _qwenimage21_prefix_segments(image_ids, prefix_len)
+                segment_masks = _qwenimage21_segment_masks(
+                    segments, joint_key_valid, device
+                )
+
+        return QwenImage21PreparedContext(
+            transformer_id=id(self),
+            prompt_shape=prompt_shape,
+            prompt_dtype=prompt_dtype,
+            img_shapes=tuple(
+                tuple(tuple(shape) for shape in sample) for sample in img_shapes
+            ),
+            processor_types=processor_types,
+            source_tensors=source_tensors,
+            source_versions=source_versions,
+            text_projection_signature=(
+                self._text_projection_signature() if cache_frozen_text else ()
+            ),
+            projected_text=projected_text,
+            image_positions=image_positions,
+            text_positions=text_positions,
+            target_token_mask=target_token_mask,
+            rotary_emb=rotary_emb,
+            target_tokens=target_tokens,
+            prefix_len=prefix_len,
+            joint_key_valid=joint_key_valid,
+            attention_mask=attention_mask,
+            segments=None if segments is None else tuple(segments),
+            segment_masks=None if segment_masks is None else tuple(segment_masks),
+        )
+
+    @torch.no_grad()
+    def prepare_context(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        img_shapes: list[list[tuple[int, int, int]]],
+        img_mask: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+    ) -> QwenImage21PreparedContext:
+        """Prepare one immutable prompt/layout while ``txt_in`` is frozen.
+
+        Rebuild after changing the prompt, layout, text projection weights or
+        attention processor types. Block weights may train normally: no block
+        activation or KV projection is cached here.
+        """
+        if encoder_hidden_states.shape[0] != 1:
+            raise ValueError("Prepared contexts currently require batch size 1.")
+        if encoder_hidden_states.requires_grad or not self.is_text_projection_frozen():
+            raise ValueError(
+                "Prepared contexts require frozen prompt embeddings and unpatched, frozen txt_in."
+            )
+        return self._build_context(
+            encoder_hidden_states,
+            img_shapes,
+            img_mask,
+            encoder_hidden_states_mask,
+            cache_frozen_text=True,
+        )
+
     @apply_lora_scale("attention_kwargs")
     def forward(
         self,
@@ -1078,6 +1263,8 @@ class QwenImage21Transformer2DModel(
         kv_cache: QwenImage21KVCache | None = None,
         kv_cache_mode: str | None = None,
         return_dict: bool = True,
+        prepared_context: QwenImage21PreparedContext | None = None,
+        target_only: bool = False,
     ) -> torch.Tensor | Transformer2DModelOutput:
         r"""
         Args:
@@ -1105,6 +1292,11 @@ class QwenImage21Transformer2DModel(
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.modeling_outputs.Transformer2DModelOutput`] instead of a plain
                 tuple.
+            prepared_context (`QwenImage21PreparedContext`, *optional*):
+                Fixed frozen text/layout from `prepare_context`; inputs must still describe that exact prompt.
+            target_only (`bool`, *optional*, defaults to `False`):
+                Return only target tokens. Prune the final head when it is deterministic and unpatched; every
+                transformer block still processes the full sequence.
 
         Returns:
             [`~models.modeling_outputs.Transformer2DModelOutput`] or `tuple`:
@@ -1127,33 +1319,60 @@ class QwenImage21Transformer2DModel(
                 f"kv_cache_mode is {kv_cache_mode!r} but no kv_cache was passed to hold the prefix."
             )
 
+        # Preserve projection order on the uncached path (including adapter RNG).
         hidden_states = self.img_in(hidden_states)
-        encoder_hidden_states = self.txt_in(encoder_hidden_states)
-
-        # Each vision-language image slot stands for 2x2 latent tokens, so expand those positions four-fold and drop
-        # the actual latents into them. Samples share a layout, hence the single row.
-        repeats = torch.where(img_mask, _IMG_TOKENS_PER_SLOT, 1)[0]
-        image_pad_mask = torch.repeat_interleave(img_mask[0], repeats)
-
-        target_tokens = math.prod(img_shapes[0][-1])
-        joint_hidden_states = torch.cat(
-            [
+        if prepared_context is not None:
+            context = prepared_context
+            if (
+                context.transformer_id != id(self)
+                or batch_size != 1
+                or tuple(encoder_hidden_states.shape) != context.prompt_shape
+                or encoder_hidden_states.dtype != context.prompt_dtype
+                or encoder_hidden_states.device != context.projected_text.device
+                or hidden_states.device != context.projected_text.device
+                or hidden_states.dtype != context.projected_text.dtype
+                or tuple(
+                    tuple(tuple(shape) for shape in sample) for sample in img_shapes
+                ) != context.img_shapes
+                or tuple(
+                    type(block.attn.processor) for block in self.transformer_blocks
+                ) != context.processor_types
+                or any(
+                    current is not cached
+                    or (current is not None and current._version != version)
+                    for current, cached, version in zip(
+                        (encoder_hidden_states, img_mask, encoder_hidden_states_mask),
+                        context.source_tensors,
+                        context.source_versions,
+                    )
+                )
+                or self._text_projection_signature() != context.text_projection_signature
+                or encoder_hidden_states.requires_grad
+                or not self.is_text_projection_frozen()
+            ):
+                raise ValueError(
+                    "Prepared context no longer matches this frozen prompt/model/layout."
+                )
+        else:
+            context = self._build_context(
                 encoder_hidden_states,
-                encoder_hidden_states.new_zeros(
-                    batch_size, target_tokens // 4, encoder_hidden_states.shape[2]
-                ),
-            ],
-            dim=1,
-        )
-        joint_hidden_states = joint_hidden_states.repeat_interleave(repeats, dim=1)
-        joint_hidden_states[:, image_pad_mask] = hidden_states
+                img_shapes,
+                img_mask,
+                encoder_hidden_states_mask,
+                build_attention=kv_cache_mode != "cached",
+            )
 
-        rotary_emb = self.pos_embed(
-            img_shapes[0], image_pad_mask, device=hidden_states.device
+        target_tokens, prefix_len = context.target_tokens, context.prefix_len
+        # Fresh storage, completely filled by disjoint text/image positions:
+        # neither cached text nor masks may be mutated across forwards. Integer
+        # indices also avoid resolving boolean masks on the device each time.
+        joint_hidden_states = context.projected_text.new_empty(
+            batch_size, context.target_token_mask.shape[0], self.inner_dim
         )
-        image_ids, target_token_mask = self.build_token_metadata(
-            image_pad_mask, img_shapes[0]
-        )
+        joint_hidden_states[:, context.text_positions] = context.projected_text
+        joint_hidden_states[:, context.image_positions] = hidden_states
+        rotary_emb = context.rotary_emb
+        target_token_mask = context.target_token_mask
 
         timestep = timestep.to(hidden_states.dtype)
         if self.config.causal_condition:
@@ -1166,24 +1385,7 @@ class QwenImage21Transformer2DModel(
         temb = self.time_text_embed(timestep, hidden_states)
         modulation = self.modulation(temb)
 
-        # Right-padded prompt positions must never be attended to, on any path. Text positions of the joint sequence
-        # line up, in order, with the non-image positions of the vision-language sequence — the two are interleaved,
-        # so the mask cannot be sliced off as a prefix.
-        joint_key_valid = None
-        if encoder_hidden_states_mask is not None:
-            joint_key_valid = torch.ones(
-                batch_size,
-                image_pad_mask.shape[0],
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-            text_positions = (~image_pad_mask).nonzero(as_tuple=True)[0]
-            vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
-            joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[
-                :, vlm_text_positions
-            ]
-
-        prefix_len = int((~target_token_mask).sum())
+        joint_key_valid = context.joint_key_valid
 
         if kv_cache_mode == "cached":
             # decode: only the target image's queries are recomputed. The block-causal mask degenerates to full
@@ -1197,30 +1399,14 @@ class QwenImage21Transformer2DModel(
             )
             cache_write_slice = None
             block_segments, block_key_valid = None, None
+            block_segment_masks = None
         else:
             # prefill: the whole joint sequence. The block-causal structure goes down in whichever form the
             # installed processors read it — a flex `BlockMask`, per-segment boundaries, or both for a mixed set —
             # so neither path pays for building the other's metadata.
-            processors = [block.attn.processor for block in self.transformer_blocks]
-            needs_block_mask = any(
-                isinstance(processor, QwenImage21FlexAttnProcessor)
-                for processor in processors
-            )
-            attention_mask = (
-                build_qwenimage21_block_causal_mask(
-                    image_ids, joint_key_valid, batch_size, hidden_states.device
-                )
-                if needs_block_mask
-                else None
-            )
-            block_segments = (
-                None
-                if all(
-                    isinstance(processor, QwenImage21FlexAttnProcessor)
-                    for processor in processors
-                )
-                else _qwenimage21_prefix_segments(image_ids, prefix_len)
-            )
+            attention_mask = context.attention_mask
+            block_segments = context.segments
+            block_segment_masks = context.segment_masks
             cache_write_slice = (
                 slice(0, prefix_len) if kv_cache_mode == "extract" else None
             )
@@ -1243,6 +1429,7 @@ class QwenImage21Transformer2DModel(
                     cache_write_slice,
                     block_segments,
                     block_key_valid,
+                    block_segment_masks,
                 )
             else:
                 joint_hidden_states = block(
@@ -1256,10 +1443,20 @@ class QwenImage21Transformer2DModel(
                     cache_write_slice=cache_write_slice,
                     segments=block_segments,
                     key_valid=block_key_valid,
+                    segment_masks=block_segment_masks,
                 )
 
+        if target_only and not (
+            _has_patched_or_stochastic_forward(self.norm_out)
+            or _has_patched_or_stochastic_forward(self.proj_out)
+        ):
+            joint_hidden_states = joint_hidden_states[:, -target_tokens:]
+            if modulation_mask is not None:
+                modulation_mask = modulation_mask[-target_tokens:]
         joint_hidden_states = self.norm_out(joint_hidden_states, temb, modulation_mask)
         output = self.proj_out(joint_hidden_states)
+        if target_only:
+            output = output[:, -target_tokens:]
 
         if not return_dict:
             return (output,)

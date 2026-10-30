@@ -17,11 +17,14 @@ import math
 from typing import List, Optional
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange, repeat
 from PIL import Image
 from diffusers.utils.torch_utils import randn_tensor
 
-from .mmdit import SingleStreamDiT
+from .mmdit import (
+    SingleStreamDiT, _PreparedVelocityContext, _geometry_model_signature, _mask,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +147,65 @@ def pack_ref_latents(
     return tokens, pos, mask
 
 
+@torch.no_grad()
+def prepare_velocity_context(
+    model: SingleStreamDiT,
+    latents: torch.Tensor,
+    context: torch.Tensor,
+    text_mask: torch.Tensor,
+    *,
+    isolate_refs: bool = False,
+) -> _PreparedVelocityContext:
+    """Prepare one fixed T2I item's raw text and geometry for repeated calls.
+
+    No image values, text-fusion outputs, learned projections or attention K/V
+    are retained. Every prediction still consumes fresh noisy image tokens and
+    reruns every learned operation. The caller owns and bounds these per-item
+    objects; changing source tensors or geometry requires a new context.
+    """
+    if latents.ndim != 4 or context.ndim != 3 or text_mask.ndim != 2:
+        raise ValueError("Prepared Krea inputs must be BCHW latents, BLF text and BL mask")
+    b, c, h, w = latents.shape
+    patch = model.config.patch
+    if (
+        patch <= 0 or h % patch or w % patch or c != model.config.channels
+        or context.shape[:2] != text_mask.shape or context.shape[0] != b
+        or context.shape[-1] != model.config.txtlayers * model.config.txtdim
+    ):
+        raise ValueError("Prepared Krea inputs do not match the model geometry")
+    if context.device != latents.device or text_mask.device != latents.device:
+        raise ValueError("Prepared Krea text and mask must be on the latent device")
+    if context.requires_grad or text_mask.requires_grad:
+        raise ValueError("Prepared Krea context requires fixed, detached text inputs")
+    model_signature = _geometry_model_signature(model)
+    try:
+        versions = (context._version, text_mask._version)
+    except RuntimeError as exc:
+        raise ValueError("Prepared Krea text must have tensor version counters") from exc
+
+    # Use exactly the ordinary packing path's positions/masks, dropping the
+    # clean image tokens immediately; they must never replace noisy-step input.
+    _, pos, mask = prepare(latents, context.shape[1], patch, text_mask)
+    padlen = (-mask.shape[1]) % 256
+    padded_mask = F.pad(mask, (0, padlen), value=False) if padlen else mask
+    padded_pos = F.pad(pos, (0, 0, 0, padlen)) if padlen else pos
+    return _PreparedVelocityContext(
+        features=context,
+        text_mask=text_mask,
+        stacked_context=context.reshape(b, context.shape[1], model.config.txtlayers, -1),
+        pos=pos,
+        mask=mask,
+        text_attention_mask=_mask(mask[:, :context.shape[1]]),
+        attention_mask=_mask(padded_mask),
+        freqs=model.posemb(padded_pos),
+        padlen=padlen,
+        latent_spec=(tuple(latents.shape), latents.device, latents.dtype),
+        model_signature=model_signature,
+        source_versions=versions,
+        isolate_refs=isolate_refs,
+    )
+
+
 def predict_velocity(
     model: SingleStreamDiT,
     latents: torch.Tensor,  # (B, C, h, w)
@@ -153,6 +215,7 @@ def predict_velocity(
     ref_latents: Optional[List[List[torch.Tensor]]] = None,  # per-sample (C, h, w) refs
     isolate_refs: bool = False,
     ref_kv_cache: Optional[dict] = None,
+    prepared_context: Optional[_PreparedVelocityContext] = None,
 ) -> torch.Tensor:
     """Run the MMDiT on the packed [text | image | refs] sequence.
 
@@ -170,10 +233,18 @@ def predict_velocity(
     tokens are dropped from the sequence and the cached K/V are injected as
     extra attention keys -- identical math, no ref recompute per step. Returns
     the velocity ``noise - clean`` reshaped back to ``(B, C, h, w)``. No time
-    flip / negation: Krea's convention matches toolkit's.
+    flip / negation: Krea's convention matches toolkit's. ``prepared_context``
+    optionally reuses only fixed T2I geometry and requires the exact raw text
+    tensors passed to ``prepare_velocity_context``; refs/KV remain unsupported
+    on that opt-in path.
     """
     patch = model.config.patch
     b, c, h, w = latents.shape
+
+    if prepared_context is not None:
+        if ref_latents is not None or ref_kv_cache is not None:
+            raise ValueError("Prepared Krea geometry does not support references or K/V caches")
+        prepared_context.validate_inputs(latents, context, text_mask)
 
     if ref_kv_cache is not None and not isolate_refs:
         raise ValueError(
@@ -185,12 +256,18 @@ def predict_velocity(
         ref_latents = None  # the refs are consumed from the cache instead
 
     # Restore the stacked-layer axis flattened in pad_text_features: F -> (n, d).
-    n = model.config.txtlayers
-    context = context.reshape(
-        context.shape[0], context.shape[1], n, context.shape[-1] // n
-    )
-
-    img_tokens, pos, mask = prepare(latents, context.shape[1], patch, text_mask)
+    if prepared_context is None:
+        n = model.config.txtlayers
+        context = context.reshape(
+            context.shape[0], context.shape[1], n, context.shape[-1] // n
+        )
+        img_tokens, pos, mask = prepare(latents, context.shape[1], patch, text_mask)
+    else:
+        context = prepared_context.stacked_context
+        img_tokens = rearrange(
+            latents, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch
+        )
+        pos, mask = prepared_context.pos, prepared_context.mask
 
     reflen = 0
     ref_mask = None
@@ -219,6 +296,7 @@ def predict_velocity(
         ref_kv_cache=(ref_kv_cache["kv"], ref_kv_cache["mask"])
         if reuse_ref_kv
         else None,
+        **({"prepared_context": prepared_context} if prepared_context is not None else {}),
     )
 
     if capture is not None:
