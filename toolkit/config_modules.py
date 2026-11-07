@@ -71,6 +71,7 @@ class SampleItem:
         self.seed: Optional[int] = kwargs.get('seed', None) # if none, default to autogen seed
         self.guidance_scale: float = kwargs.get('guidance_scale', sample_config.guidance_scale)
         self.sample_steps: int = kwargs.get('sample_steps', sample_config.sample_steps)
+        self.sigmas: Optional[List[float]] = kwargs.get('sigmas', sample_config.sigmas)
         self.fps: int = kwargs.get('fps', sample_config.fps)
         self.num_frames: int = kwargs.get('num_frames', sample_config.num_frames)
         # audio models: max seconds to generate
@@ -106,6 +107,8 @@ class SampleConfig:
         self.walk_seed = kwargs.get('walk_seed', False)
         self.guidance_scale = kwargs.get('guidance_scale', 7)
         self.sample_steps = kwargs.get('sample_steps', 20)
+        # explicit sigma schedule, 1.0 = pure noise, 0.0 = clean. Descending; the final 0.0 is added automatically, so [1.0, 0.5] = 2 steps. Overrides sample_steps
+        self.sigmas: Optional[List[float]] = kwargs.get('sigmas', None)
         self.network_multiplier = kwargs.get('network_multiplier', 1)
         self.guidance_rescale = kwargs.get('guidance_rescale', 0.0)
         self.ext: ImgExt = kwargs.get('format', 'jpg')
@@ -538,7 +541,7 @@ class TrainConfig:
         self.correct_pred_norm = kwargs.get('correct_pred_norm', False)
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
-        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow, pseudo_huber
+        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, band, pixelspace, mean_flow, pseudo_huber
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)
@@ -584,6 +587,9 @@ class TrainConfig:
         self.unload_text_encoder = kwargs.get('unload_text_encoder', False)
         # will toggle all datasets to cache text embeddings
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
+        # merge all datasets into one file list so buckets/batches mix across folders;
+        # reg datasets pool separately from non-reg ones
+        self.pool_datasets: bool = kwargs.get('pool_datasets', False)
         # for swapping which parameters are trained during training
         self.do_paramiter_swapping = kwargs.get('do_paramiter_swapping', False)
         # 0.1 is 10% of the parameters active at a time lower is less vram, higher is more
@@ -1071,6 +1077,9 @@ class DatasetConfig:
         # which can cause severe PCIe thrashing for users at the VRAM ceiling.
         # Opt in if you have stable VRAM headroom and want the transfer speedup.
         self.pin_memory: bool = kwargs.get('pin_memory', False)
+        # threads that decode/resize the images of one bucketed batch concurrently inside a
+        # dataloader worker; 0 or 1 loads the batch serially
+        self.batch_load_threads: int = kwargs.get('batch_load_threads', min(8, os.cpu_count() or 1))
         # threads used to prep (decode/resize) items ahead of the VAE while caching latents
         self.cache_latents_num_workers: int = kwargs.get('cache_latents_num_workers', min(6, os.cpu_count() or 1))
         self.extra_values: List[float] = kwargs.get('extra_values', [])
@@ -1122,10 +1131,28 @@ class DatasetConfig:
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
     """
-    This just splits up the datasets by resolutions so you dont have to do it manually
+    This just splits up the datasets by paths and resolutions so you dont have to do it manually
     :param raw_config:
     :return:
     """
+    # split up datasets by folder_path / dataset_path lists: one dataset per path,
+    # all other settings shared (pair with train.pool_datasets to mix them)
+    path_split_config = []
+    for dataset in raw_config:
+        split = False
+        for path_key in ['folder_path', 'dataset_path']:
+            paths = dataset.get(path_key, None)
+            if isinstance(paths, (list, tuple)):
+                for path in paths:
+                    dataset_copy = dataset.copy()
+                    dataset_copy[path_key] = path
+                    path_split_config.append(dataset_copy)
+                split = True
+                break
+        if not split:
+            path_split_config.append(dataset)
+    raw_config = path_split_config
+
     # split up datasets by resolutions
     new_config = []
     for dataset in raw_config:
@@ -1177,10 +1204,15 @@ class GenerateImageConfig:
             duration: Optional[float] = None,  # audio models: max seconds
             ctrl_idx: int = 0,
             do_cfg_norm: bool = False,
+            sigmas: Optional[List[float]] = None,  # explicit schedule; replaces num_inference_steps
     ):
         self.width: int = width
         self.height: int = height
         self.num_inference_steps: int = num_inference_steps
+        from toolkit.sample_sigmas import normalize_sample_sigmas
+        self.sigmas: Optional[List[float]] = normalize_sample_sigmas(sigmas)
+        if self.sigmas is not None:
+            self.num_inference_steps = len(self.sigmas)
         self.guidance_scale: float = guidance_scale
         self.guidance_rescale: float = guidance_rescale
         self.prompt: str = prompt
